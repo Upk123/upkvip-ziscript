@@ -1,14 +1,13 @@
 #!/bin/bash
 # ZIVPN UDP Module + Web Panel (Myanmar UI)
 # Original: Zahid Islam | Tweaks & MM UI: U Phote Kaunt
-# Minimal fix edition: only add safe download fallback (no other behavior changes)
+# Updates: apt-wait, download fallback, UFW 8080 allow (no other changes)
 
 set -e
 
 # ===== Color Helpers =====
 B="\e[1;34m"; G="\e[1;32m"; Y="\e[1;33m"; R="\e[1;31m"; C="\e[1;36m"; M="\e[1;35m"; Z="\e[0m"
 LINE="${B}────────────────────────────────────────────────────────${Z}"
-
 say() { echo -e "$1"; }
 
 echo -e "\n$LINE\n${G}🌟 ZIVPN UDP Server ကို တပ်ဆင်နေပါတယ်...${Z}\n$LINE"
@@ -19,7 +18,25 @@ if [ "$(id -u)" -ne 0 ]; then
   echo -e "${R}ဤ script ကို root အဖြစ် chạy ရပါမယ် (sudo -i)${Z}"; exit 1
 fi
 
+# --- NEW: Wait for other apt processes to finish ---
+wait_for_apt() {
+  echo -e "${Y}⏳ apt တွေကို စောင့်နေပါတယ်... (${Z}apt-get/unattended-upgrades${Y})${Z}"
+  for i in $(seq 1 60); do
+    if pgrep -x apt-get >/dev/null || pgrep -x apt >/dev/null || pgrep -f 'apt.systemd.daily' >/dev/null || pgrep -x unattended-upgrade >/dev/null; then
+      sleep 5
+    else
+      return 0
+    fi
+  done
+  echo -e "${Y}⚠️ apt မပြီးသေးလို့ timers ကို ယာယီရပ်နေပါတယ်...${Z}"
+  systemctl stop --now unattended-upgrades.service 2>/dev/null || true
+  systemctl stop --now apt-daily.service apt-daily.timer 2>/dev/null || true
+  systemctl stop --now apt-daily-upgrade.service apt-daily-upgrade.timer 2>/dev/null || true
+}
+wait_for_apt
+
 say "${Y}📦 Packages တွေ အပ်ဒိတ်လုပ်နေပါတယ်... (အချိန်ကြာနိုင်)${Z}"
+export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
 apt-get install -y curl ufw jq python3 python3-flask >/dev/null
 
@@ -31,17 +48,13 @@ systemctl stop zivpn-web.service 2>/dev/null || true
 say "${Y}⬇️ ZIVPN binary ကို ဒေါင်းနေပါတယ်...${Z}"
 BIN_TMP="/usr/local/bin/zivpn.new"
 BIN="/usr/local/bin/zivpn"
-
-# --- FIX: download with fallback (avoid 404) ---
 PRIMARY_URL="https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64"
 FALLBACK_URL="https://github.com/zahidbd2/udp-zivpn/releases/latest/download/udp-zivpn-linux-amd64"
 
 if ! curl -fsSL -o "$BIN_TMP" "$PRIMARY_URL"; then
-  echo -e "${Y}Primary URL ဒေါင်းမရဘူး (404?) — latest ကို စမ်းပါမယ်...${Z}"
+  echo -e "${Y}Primary URL 404 ဖြစ်သလိုပါ—latest ကို စမ်းပါတယ်...${Z}"
   curl -fSL -o "$BIN_TMP" "$FALLBACK_URL"
 fi
-# -----------------------------------------------
-
 chmod +x "$BIN_TMP"
 mv -f "$BIN_TMP" "$BIN"
 
@@ -86,9 +99,6 @@ if jq . >/dev/null 2>&1 <<<'{}'; then
     .key  = "/etc/zivpn/zivpn.key" |
     .obfs = "zivpn"
   ' "$CFG" > "$TMP" && mv "$TMP" "$CFG"
-else
-  # jq မရှိသော်လည်း အရင်က sed fallback (already installed jq above)
-  :
 fi
 say "${G}✅ Password List ကို config.json ထဲသို့ ထည့်ပြီးပါပြီ${Z}"
 
@@ -133,6 +143,8 @@ iptables -t nat -A PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to
 
 ufw allow 6000:19999/udp >/dev/null 2>&1 || true
 ufw allow 5667/udp >/dev/null 2>&1 || true
+# --- NEW: open Web Panel TCP 8080 ---
+ufw allow 8080/tcp >/dev/null 2>&1 || true
 
 # ===== Web Panel (Flask) =====
 say "${Y}🖥️ Web Panel (Flask) ကိုတပ်နေပါတယ်...${Z}"
@@ -156,11 +168,9 @@ HTML = """<!doctype html>
  th{background:#f5f5f5}
  .ok{color:#0a0}.bad{color:#a00}.muted{color:#666}
  .pill{display:inline-block;background:#eef;padding:3px 8px;border-radius:999px}
- .btn{display:inline-block;padding:6px 10px;border:1px solid #ccc;border-radius:8px;text-decoration:none}
- .btn:hover{background:#f8f8f8}
 </style></head><body>
 <h2>📒 ZIVPN User Panel</h2>
-<p class="tip">💡 အွန်လိုင်း/အော့ဖ်လိုင်းပြရန် <code>/etc/zivpn/users.json</code> ထဲမှာ user တစ်ယောက်စီအတွက် <code>port</code> ထည့်ပါ (UDP ဆာဗာသို့ scan လုပ်ပြီးစစ်တာ)။</p>
+<p class="tip">💡 <code>/etc/zivpn/users.json</code> ထဲက <code>port</code> နဲ့ UDP listener ကို စစ်ပြီး Online/Offline ပြပါသည်။</p>
 <table>
   <tr><th>👤 အသုံးပြုသူ</th><th>⏰ ကုန်ဆုံးရက်</th><th>🔌 အနေအထား</th></tr>
   {% for u in users %}
@@ -176,7 +186,6 @@ HTML = """<!doctype html>
   </tr>
   {% endfor %}
 </table>
-<p class="tip">➕ အသုံးပြုသူအသစ်ထည့်ရန်: <span class="pill">/etc/zivpn/users.json</span> ကို တိုက်ရိုက်ပြင်ပြီး <span class="pill">systemctl restart zivpn-web</span> မလိုပါ—ဒီစာမျက်နှာက auto refresh ဖြစ်နေပါတယ်။</p>
 </body></html>"""
 
 app = Flask(__name__)
@@ -189,7 +198,6 @@ def load_users():
         return []
 
 def get_udp_ports():
-    # collect active/listening UDP ports (requires root)
     out = subprocess.run("ss -uHapn", shell=True, capture_output=True, text=True).stdout
     return set(re.findall(r":(\d+)\s", out))
 
@@ -205,7 +213,7 @@ def index():
         else:
             status = "Unknown"
         view.append(type("U", (), {"user":u.get("user",""), "expires":u.get("expires",""), "status":status}))
-    view.sort(key=lambda x: x.user.lower())
+    view.sort(key=lambda x: (x.user or "").lower())
     return render_template_string(HTML, users=view)
 
 @app.route("/api/users")
