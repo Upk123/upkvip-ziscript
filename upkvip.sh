@@ -1,10 +1,135 @@
-# 1) backup
-sudo cp -a /etc/zivpn/web.py /etc/zivpn/web.py.bak.$(date +%F-%H%M) 2>/dev/null || true
+#!/bin/bash
+# ZIVPN UDP Module + Web Panel + User Manager (Burmese Friendly)
+# Base by: Zahid Islam | Refactor: U Phote Kaunt (မြန်မာ UI/messages ထည့်သွင်း)
 
-# 2) write new web.py with Myanmar UI + Text view
-sudo tee /etc/zivpn/web.py >/dev/null <<'PY'
-from flask import Flask, jsonify, render_template_string, Response
-import json, re, subprocess, os
+set -euo pipefail
+
+green(){ echo -e "\e[92m$*\e[0m"; }
+yellow(){ echo -e "\e[93m$*\e[0m"; }
+red(){ echo -e "\e[91m$*\e[0m"; }
+
+green "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+green "   ✨ ZIVPN UDP Server ကို သန့်သန့်ရှင်းရှင်း အပြီးအစီးသွင်းနေပါပြီ"
+green "   • Web Panel (8080)   • Users/Expires  • Online/Offline"
+green "   • မြန်မာ UI messages"
+green "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# -------- 0) Basic deps
+yellow "🔧 Packages ရှာနေ/သွင်းနေ..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y >/dev/null
+apt-get install -y wget curl ufw openssl python3 python3-flask >/dev/null
+
+# -------- 1) Install ZIVPN binary
+yellow "⬇️ ZIVPN binary ထည့်နေ..."
+install -d -m 755 /usr/local/bin
+wget -q https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64 -O /usr/local/bin/zivpn
+chmod +x /usr/local/bin/zivpn
+
+# -------- 2) Config folder + default config
+install -d -m 755 /etc/zivpn
+if [ ! -f /etc/zivpn/config.json ]; then
+  yellow "📄 default config.json ဆွဲယူနေ..."
+  if ! wget -q https://raw.githubusercontent.com/zahidbd2/udp-zivpn/main/config.json -O /etc/zivpn/config.json; then
+    # fallback very small config
+    cat >/etc/zivpn/config.json <<'CFG'
+{
+  "listen": ":5667",
+  "cert": "/etc/zivpn/zivpn.crt",
+  "key":  "/etc/zivpn/zivpn.key",
+  "obfs": "zivpn",
+  "auth": { "mode": "passwords", "config": ["zi"] },
+  "config": []
+}
+CFG
+  fi
+fi
+
+# -------- 3) Certificates (self-signed)
+if [ ! -f /etc/zivpn/zivpn.crt ] || [ ! -f /etc/zivpn/zivpn.key ]; then
+  yellow "🔐 ဆိုင်ဖာထုတ်စစ်လက်မှတ် files တည်ဆောက်နေ..."
+  openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 \
+    -subj "/C=MM/ST=Yangon/L=Yangon/O=UPhoteKaunt/OU=ZIVPN/CN=zivpn" \
+    -keyout "/etc/zivpn/zivpn.key" -out "/etc/zivpn/zivpn.crt" >/dev/null 2>&1
+fi
+
+# -------- 4) Ask passwords -> write into config.json
+echo
+yellow "🔑 ZIVPN UDP စကားဝှက်များ ကိုမာများ (ဥပမာ: upkvip,alice,pass1)"
+read -rp "    မထည့်ရင် 'zi' ကို default ယူပါမယ်: " input_config || true
+
+if [ -n "${input_config:-}" ]; then
+  IFS=',' read -r -a config <<< "$input_config"
+else
+  config=("zi")
+fi
+# build JSON list
+pw_list=$(printf '"%s",' "${config[@]}" | sed 's/,$//')
+
+# Replace/ensure passwords array
+if grep -q '"auth"' /etc/zivpn/config.json; then
+  # replace whatever inside "config": [ ... ]
+  sed -i -E '0,/"auth"[^\}]*"config":[^\]]*\]/s//"auth": { "mode":"passwords", "config": ['"$pw_list"'] }/' /etc/zivpn/config.json
+else
+  # append auth block
+  sed -i 's@^{@{ "auth": { "mode":"passwords","config": ['"$pw_list"'] }, @' /etc/zivpn/config.json
+fi
+
+# -------- 5) users.json (for panel) – create if missing, seed from passwords
+if [ ! -f /etc/zivpn/users.json ]; then
+  yellow "👥 users.json တည်ဆောက်နေ (expires 30 ရက်) ..."
+  exp=$(date -d '+30 days' -Iseconds 2>/dev/null || date -v+30d -Iseconds)
+  {
+    echo "["
+    n=${#config[@]}
+    for i in "${!config[@]}"; do
+      p="${config[$i]}"
+      printf '  {"user":"%s","pass":"%s","expires":"%s"}' "$p" "$p" "$exp"
+      if [ "$i" -lt $((n-1)) ]; then echo ","; else echo; fi
+    done
+    echo "]"
+  } > /etc/zivpn/users.json
+fi
+
+# -------- 6) systemd service (zivpn)
+yellow "🧩 systemd service တင်နေ..."
+cat >/etc/systemd/system/zivpn.service <<'UNIT'
+[Unit]
+Description=ZIVPN UDP Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/zivpn
+ExecStart=/usr/local/bin/zivpn server -c /etc/zivpn/config.json
+Restart=always
+RestartSec=3
+Environment=ZIVPN_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now zivpn.service || true
+
+# -------- 7) NAT + firewall
+yellow "🛡 firewall/NAT ပြင်နေ..."
+IFACE=$(ip -4 route ls | awk '/default/ {print $5; exit}')
+iptables -t nat -C PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667 2>/dev/null || \
+iptables -t nat -A PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
+ufw allow 6000:19999/udp >/dev/null 2>&1 || true
+ufw allow 5667/udp >/dev/null 2>&1 || true
+
+# -------- 8) Web Panel (Flask)
+yellow "🌐 Web Panel (8080) တပ်နေ..."
+cat >/etc/zivpn/web.py <<'PY'
+from flask import Flask, jsonify, render_template_string
+import json, re, subprocess
 
 USERS_FILE = "/etc/zivpn/users.json"
 
@@ -12,86 +137,36 @@ HTML = """<!doctype html>
 <html lang="my"><head><meta charset="utf-8">
 <title>ZIVPN User Panel</title>
 <meta http-equiv="refresh" content="10">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Myanmar:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
-:root{
-  --bg:#0f172a; --card:#111827; --muted:#9ca3af; --ok:#22c55e; --bad:#ef4444; --acc:#38bdf8;
-}
-*{box-sizing:border-box}
-body{
-  margin:0; padding:0 20px 40px;
-  font-family:"Noto Sans Myanmar", system-ui, Segoe UI, Roboto, Arial, "Myanmar Sans Pro";
-  color:#e5e7eb; background:linear-gradient(180deg,#0b1220, #0f172a 60%, #0b1220);
-}
-.header{
-  max-width:980px; margin:24px auto;
-  background:linear-gradient(135deg,#0ea5e9 0%,#22c55e 100%);
-  color:#0b1220; border-radius:18px; padding:18px 20px; box-shadow:0 10px 30px rgba(0,0,0,.25);
-}
-.h-title{font-size:28px; font-weight:800; letter-spacing:.3px}
-.h-sub{opacity:.9; margin-top:6px}
-.badge{display:inline-block; font-size:12px; padding:4px 10px; border-radius:999px; background:#0b1220; color:#a7f3d0; margin-left:8px}
-
-.card{max-width:980px; margin:18px auto; background:var(--card); border:1px solid rgba(255,255,255,.06); border-radius:16px; overflow:hidden}
-.tbl{width:100%; border-collapse:collapse}
-.tbl th,.tbl td{padding:10px 12px; border-bottom:1px solid rgba(255,255,255,.06); text-align:left}
-.tbl th{background:#0b1220; color:#cbd5e1; font-weight:700}
-.status-ok{color:var(--ok); font-weight:700}
-.status-bad{color:var(--bad); font-weight:700}
-.status-mut{color:var(--muted); font-weight:600}
-.note{max-width:980px; margin:8px auto 0; color:var(--muted); font-size:13px}
-.actions{max-width:980px; margin:10px auto 0; display:flex; gap:10px; flex-wrap:wrap}
-.btn{border:1px solid rgba(255,255,255,.12); background:#0b1220; color:#cbd5e1; padding:8px 12px; border-radius:10px; text-decoration:none}
-.btn:hover{border-color:#38bdf8; color:#e0f2fe}
-.footer{max-width:980px; margin:20px auto 0; color:#94a3b8; font-size:12px}
-.brand{color:#e2f0ff; font-weight:700}
-</style></head>
-<body>
-  <div class="header">
-    <div class="h-title">ZIVPN VPN (UDP) — Control Panel
-      <span class="badge">U Phue Kaunt မှ ပြန်လည် ပြုစုပြင်ဆင်ရေးသားထားသည်</span>
-    </div>
-    <div class="h-sub">တင်ထားသော အသုံးပြုသူများ၏ သက်တမ်း/အွန်လိုင်းအခြေအနေ ကို မိနစ်တိုင်း အလိုအလျောက် ပြန်လည် تازهတင် ပြသပေးပါသည်။</div>
-  </div>
-
-  <div class="card">
-    <table class="tbl">
-      <tr>
-        <th style="width:32%">👤 အသုံးပြုသူ (User)</th>
-        <th style="width:38%">⏳ သက်တမ်းကုန်ချိန် (Expires)</th>
-        <th>📶 အခြေအနေ (Status)</th>
-      </tr>
-      {% if not users %}
-      <tr><td colspan="3" class="status-mut">/etc/zivpn/users.json ထဲတွင် user မရှိသေးပါ — ဥပမာ
-      {"user":"demo","pass":"demo123","expires":"2026-12-31T23:59:59+07:00","port":6001}</td></tr>
-      {% endif %}
-      {% for u in users %}
-      <tr>
-        <td>{{u.user}}</td>
-        <td>{{u.expires}}</td>
-        <td>
-          {% if u.status=="Online" %}<span class="status-ok">Online</span>
-          {% elif u.status=="Offline" %}<span class="status-bad">Offline</span>
-          {% else %}<span class="status-mut">Unknown</span>
-          {% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </table>
-  </div>
-
-  <div class="actions">
-    <a class="btn" href="/text">📝 Text View (မြန်မာ)</a>
-    <a class="btn" href="/api/users">🔗 JSON API</a>
-  </div>
-
-  <div class="note">မှတ်ချက် — အွန်လိုင်း/အော့ဖ်လိုင်း ကို တိတိကျကျ ပြချင်ရင် users.json ထဲတွင်
-  <b>"port": 6001</b> စသည်ဖြင့် client သုံးမယ့် UDP port ကို သတ်မှတ်ပေးပါ။</div>
-
-  <div class="footer">© ZIVPN • Crafted with <span class="brand">U Phue Kaunt</span></div>
-</body></html>
-"""
+  body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;background:#fafafa}
+  h2{margin:0 0 12px}
+  .tip{color:#666;margin:6px 0 18px}
+  table{border-collapse:collapse;width:100%;max-width:820px;background:#fff}
+  th,td{border:1px solid #e5e5e5;padding:10px 12px;text-align:left}
+  th{background:#f6f8fa}
+  .ok{color:#0a0;font-weight:600}
+  .bad{color:#c00;font-weight:600}
+  .muted{color:#777}
+  .brand{font-weight:700;background:linear-gradient(90deg,#0ea5e9,#22c55e);-webkit-background-clip:text;color:transparent}
+</style>
+</head><body>
+  <h2 class="brand">ZIVPN User Panel</h2>
+  <div class="tip">💡 အွန်လိုင်း/အော့ဖ်လိုင်း ကို UDP port scan နဲ့ခနခန (10s) ပြန်စစ်ပေးတယ်။ <span class="muted">user တစ်ယောက်ချင်း "port" ထည့်ထားမလားမသိ — မထည့်ရင် Unknown ရနိုင်</span></div>
+  <table>
+   <tr><th>👤 User</th><th>⏳ Expires</th><th>📶 Status</th></tr>
+   {% for u in users %}
+   <tr>
+     <td>{{u.user}}</td>
+     <td>{{u.expires}}</td>
+     <td>
+       {% if u.status == "Online" %}<span class="ok">Online</span>
+       {% elif u.status == "Offline" %}<span class="bad">Offline</span>
+       {% else %}<span class="muted">Unknown</span>{% endif %}
+     </td>
+   </tr>
+   {% endfor %}
+  </table>
+</body></html>"""
 
 app = Flask(__name__)
 
@@ -104,20 +179,20 @@ def load_users():
 
 def get_udp_ports():
     out = subprocess.run("ss -uHapn", shell=True, capture_output=True, text=True).stdout
-    return set(re.findall(r":(\d+)\s", out))
+    return set(re.findall(r":(\\d+)\\s", out))
 
 @app.route("/")
 def index():
     users = load_users()
     active = get_udp_ports()
-    view = []
+    view=[]
     for u in users:
-        port = str(u.get("port",""))
+        port = str(u.get("port","")) if isinstance(u, dict) else ""
         if port:
             status = "Online" if port in active else "Offline"
         else:
             status = "Unknown"
-        view.append(type("U", (), {"user":u.get("user",""), "expires":u.get("expires",""), "status":status}))
+        view.append(type("U",(),{"user":u.get("user",""),"expires":u.get("expires",""),"status":status}))
     view.sort(key=lambda x: x.user.lower())
     return render_template_string(HTML, users=view)
 
@@ -130,21 +205,105 @@ def api_users():
         u["status"] = ("Online" if p in active else ("Offline" if p else "Unknown"))
     return jsonify(users)
 
-# ➕ Text view in Burmese
-@app.route("/text")
-def text_view():
-    users = load_users()
-    active = get_udp_ports()
-    lines = ["ZIVPN (UDP) — မြန်မာ Text View",
-             "U Phue Kaunt မှ ပြန်လည် ပြုစုပြင်ဆင်ရေးသားထားသည်",
-             "---------------------------------------"]
-    if not users:
-        lines.append("users.json တွင် user မရှိသေးပါ")
-    for u in users:
-        name = u.get("user","")
-        exp  = u.get("expires","")
-        p    = str(u.get("port",""))
-        st   = ("Online" if (p and p in active) else ("Offline" if p else "Unknown"))
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=8080)
+PY
+
+cat >/etc/systemd/system/zivpn-web.service <<'UNIT'
+[Unit]
+Description=ZIVPN Web Panel
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /etc/zivpn/web.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now zivpn-web.service || true
+ufw allow 8080/tcp >/dev/null 2>&1 || true
+
+# -------- 9) Helper commands (add/del/list user)
+install -d /usr/local/sbin
+
+# Add user: zivpn-add-user <user> <pass> <ISO8601-exp> [port]
+cat >/usr/local/sbin/zivpn-add-user <<'PY'
+#!/usr/bin/env python3
+import json,sys,os
+p="/etc/zivpn/users.json"
+if len(sys.argv)<4:
+  print("အသုံးပြုမှု: zivpn-add-user <user> <pass> <expires-ISO8601> [port]")
+  sys.exit(1)
+user, pw, exp = sys.argv[1], sys.argv[2], sys.argv[3]
+port = sys.argv[4] if len(sys.argv)>4 else ""
+try:
+  data=json.load(open(p))
+except:
+  data=[]
+# replace if exists
+data=[u for u in data if u.get("user")!=user]
+obj={"user":user,"pass":pw,"expires":exp}
+if port: obj["port"]=port
+data.append(obj)
+with open(p,"w") as f: json.dump(data,f,indent=2)
+print("✔ ထည့်ပြီး: ",user)
+PY
+chmod +x /usr/local/sbin/zivpn-add-user
+
+# Del user
+cat >/usr/local/sbin/zivpn-del-user <<'PY'
+#!/usr/bin/env python3
+import json,sys
+p="/etc/zivpn/users.json"
+if len(sys.argv)<2:
+  print("အသုံးပြုမှု: zivpn-del-user <user>")
+  sys.exit(1)
+user=sys.argv[1]
+try:
+  data=json.load(open(p))
+except:
+  data=[]
+before=len(data)
+data=[u for u in data if u.get("user")!=user]
+with open(p,"w") as f: json.dump(data,f,indent=2)
+print("✔ ဖယ်ရှားပြီး: ",user," (",before,"→",len(data),")")
+PY
+chmod +x /usr/local/sbin/zivpn-del-user
+
+# List users
+cat >/usr/local/sbin/zivpn-list-users <<'PY'
+#!/usr/bin/env python3
+import json
+p="/etc/zivpn/users.json"
+try:
+  data=json.load(open(p))
+except:
+  data=[]
+for u in sorted(data, key=lambda x: x.get("user","")):
+  print(f"{u.get('user','?'):15s}  exp={u.get('expires','?')}  port={u.get('port','-')}")
+PY
+chmod +x /usr/local/sbin/zivpn-list-users
+
+# -------- 10) Status
+sleep 1
+green "✅ ZIVPN UDP အင်စတောလုပ်ငန်း စည်ဆန်စွာပြီးဆုံး!"
+echo
+yellow "📍 Web Panel:   http://$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}') :8080/"
+yellow "🧩 Service:     systemctl status zivpn.service   |   systemctl status zivpn-web.service"
+yellow "👥 Users JSON:   /etc/zivpn/users.json   (user, pass, expires, [port])"
+echo
+green "အသုံးပြုရန် (မြန်မာ Command Helper)"
+echo "  • အသစ်ထည့်:  zivpn-add-user alice alice \"$(date -d '+30 days' -Iseconds 2>/dev/null || date -v+30d -Iseconds)\" 5667"
+echo "  • ဖျက်ရန်:      zivpn-del-user alice"
+echo "  • စာရင်းကြည့်:  zivpn-list-users"
+echo
+green "အောင်မြင်ပါစေ ✨"        st   = ("Online" if (p and p in active) else ("Offline" if p else "Unknown"))
         lines.append(f"👤 {name} | ⏳ {exp} | 📶 {st}")
     txt = "\n".join(lines) + "\n"
     return Response(txt, mimetype="text/plain; charset=utf-8")
