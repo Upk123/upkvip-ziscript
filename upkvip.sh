@@ -1,48 +1,73 @@
-#!/bin/bash
-# Zivpn UDP Module installer (Modified)
-# Creator: Zahid Islam | Modified by ChatGPT
+bash -c "$(curl -fsSL https://gist.githubusercontent.com/anonymous/0/raw/zivpn-allinone.sh)" || cat <<'SH' > /root/zivpn-allinone.sh
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo -e "Updating server"
-apt-get update -y && apt-get upgrade -y
+# ---------- sanity ----------
+[[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }
 
-systemctl stop zivpn.service 1>/dev/null 2>/dev/null || true
+echo "[1/8] Install deps"
+apt-get update -y
+apt-get install -y curl ca-certificates python3 python3-flask ufw
 
-echo -e "Downloading UDP Service"
-wget -q https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64 -O /usr/local/bin/zivpn
-chmod +x /usr/local/bin/zivpn
+# ---------- paths ----------
+ZDIR=/etc/zivpn
+BIN=/usr/local/bin/zivpn
+CONF=$ZDIR/config.json
+CRT=$ZDIR/zivpn.crt
+KEY=$ZDIR/zivpn.key
+UJSON=$ZDIR/users.json
+WEB=$ZDIR/web.py
+WEBUNIT=/etc/systemd/system/zivpn-web.service
+SVUNIT=/etc/systemd/system/zivpn.service
 
-# Create config folder
-mkdir -p /etc/zivpn
+mkdir -p "$ZDIR"
 
-# Default config.json (if not exists)
-if [ ! -f /etc/zivpn/config.json ]; then
-  cat <<EOF >/etc/zivpn/config.json
+echo "[2/8] Install ZIVPN binary"
+curl -fsSL https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64 -o "$BIN"
+chmod +x "$BIN"
+
+echo "[3/8] Make/keep config.json"
+if [[ ! -f "$CONF" ]]; then
+  cat > "$CONF" <<JSON
 {
   "listen": ":5667",
-  "config": ["zi"]
+  "cert": "$CRT",
+  "key": "$KEY",
+  "obfs": "zivpn",
+  "auth": {
+    "mode": "passwords",
+    "config": [ "zi" ]
+  }
 }
-EOF
+JSON
 fi
 
-# Default users.json (if not exists)
-if [ ! -f /etc/zivpn/users.json ]; then
-  echo "[]" >/etc/zivpn/users.json
+echo "[4/8] Generate TLS cert if missing"
+if [[ ! -f "$CRT" || ! -f "$KEY" ]]; then
+  openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 \
+   -subj "/C=US/ST=CA/L=LA/O=ZIVPN/OU=IT/CN=zivpn" \
+   -keyout "$KEY" -out "$CRT"
 fi
 
-echo "Generating cert files:"
-openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 \
-  -subj "/C=US/ST=California/L=Los Angeles/O=Example Corp/OU=IT Department/CN=zivpn" \
-  -keyout "/etc/zivpn/zivpn.key" -out "/etc/zivpn/zivpn.crt"
+echo "[5/8] Prompt & update passwords in config.json"
+read -rp "Enter passwords (comma-separated) [default: zi]: " INPUT || true
+INPUT="${INPUT:-zi}"
+python3 - <<PY
+import json,sys
+p="$CONF"
+cfg=json.load(open(p))
+cfg.setdefault("auth",{}).setdefault("config",[])
+cfg["auth"]["mode"]="passwords"
+cfg["auth"]["config"]=[s.strip() for s in "$INPUT".split(",") if s.strip()]
+open(p,"w").write(json.dumps(cfg,indent=2))
+print("Saved passwords:", cfg["auth"]["config"])
+PY
 
-sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1
-sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1
-
-# systemd service
-cat <<EOF >/etc/systemd/system/zivpn.service
+echo "[6/8] Systemd service for ZIVPN"
+cat > "$SVUNIT" <<'UNIT'
 [Unit]
-Description=zivpn VPN Server
+Description=ZIVPN UDP Server
 After=network.target
-
 [Service]
 Type=simple
 User=root
@@ -54,54 +79,153 @@ Environment=ZIVPN_LOG_LEVEL=info
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
-
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-# ---- Add-user helper script ----
-cat <<'SH' >/usr/local/bin/add_zivpn_user
-#!/usr/bin/env bash
-set -e
-USER="$1"
-PASS="$2"
-EXPIRES="${3:-2030-01-01T23:59:59+07:00}"
+echo "[7/8] Web panel"
+# pick web port
+WEBPORT=8080
+if ss -ltn '( sport = :8080 )' | grep -q LISTEN; then WEBPORT=8081; fi
 
-if [ -z "$USER" ] || [ -z "$PASS" ]; then
-  echo "Usage: $0 <username> <password> [expires]"
-  exit 2
+cat > "$WEB" <<'PY'
+from flask import Flask, jsonify, render_template_string
+import json, re, subprocess, os
+
+USERS_FILE = "/etc/zivpn/users.json"
+
+HTML = """<!doctype html><meta charset="utf-8">
+<title>ZIVPN User Panel</title>
+<meta http-equiv="refresh" content="10">
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}
+table{border-collapse:collapse;width:100%;max-width:820px}
+th,td{border:1px solid #ddd;padding:8px;text-align:left}
+th{background:#f5f5f5}
+.ok{color:#0a0}.bad{color:#a00}.muted{color:#666}
+</style>
+<h2>ZIVPN User Panel</h2>
+<table>
+<tr><th>User</th><th>Expires</th><th>Status</th></tr>
+{% if not users %}<tr><td colspan=3 class="muted">
+No users in /etc/zivpn/users.json
+</td></tr>{% endif %}
+{% for u in users %}
+<tr>
+  <td>{{u.user}}</td>
+  <td>{{u.expires}}</td>
+  <td>
+    {% if u.status == "Online" %}<span class="ok">Online</span>
+    {% elif u.status == "Offline" %}<span class="bad">Offline</span>
+    {% else %}<span class="muted">Unknown</span>{% endif %}
+  </td>
+</tr>
+{% endfor %}
+</table>
+<p class="muted">Tip: If you set a dedicated UDP client port for a user,
+add it as <code>"port": 6001</code> in users.json to enable best-effort status.</p>
+"""
+
+app = Flask(__name__)
+
+def load_users():
+    try:
+        with open(USERS_FILE,"r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def get_udp_ports():
+    out = subprocess.run("ss -uHapn", shell=True, capture_output=True, text=True).stdout
+    return set(re.findall(r":(\\d+)\\s", out))
+
+@app.route("/")
+def index():
+    users = load_users()
+    active = get_udp_ports()
+    view = []
+    for u in users:
+        port = str(u.get("port",""))
+        status = "Unknown"
+        if port:
+            status = "Online" if port in active else "Offline"
+        view.append(type("U", (), {
+            "user": u.get("user",""),
+            "expires": u.get("expires",""),
+            "status": status
+        }))
+    view.sort(key=lambda x: x.user.lower())
+    from flask import render_template_string
+    return render_template_string(HTML, users=view)
+
+@app.route("/api/users")
+def api_users():
+    users = load_users()
+    active = get_udp_ports()
+    for u in users:
+        p = str(u.get("port",""))
+        u["status"] = ("Online" if p in active else ("Offline" if p else "Unknown"))
+    return jsonify(users)
+
+if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT","8080"))
+    app.run(host="0.0.0.0", port=port)
+PY
+
+cat > "$WEBUNIT" <<UNIT
+[Unit]
+Description=ZIVPN Web Monitor
+After=network.target
+[Service]
+Type=simple
+User=root
+Environment=PORT=$WEBPORT
+ExecStart=/usr/bin/python3 $WEB
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# users.json bootstrap
+if [[ ! -f "$UJSON" ]]; then
+  echo "[]" > "$UJSON"
 fi
 
-mkdir -p /etc/zivpn
-[ -f /etc/zivpn/users.json ] || echo "[]" >/etc/zivpn/users.json
-[ -f /etc/zivpn/config.json ] || echo '{"listen":":5667","config":["zi"]}' >/etc/zivpn/config.json
+echo "[8/8] Firewall & start services"
+# UDP service
+ufw allow 5667/udp >/dev/null 2>&1 || true
+# Optional DNAT fan-in ports
+IFACE=$(ip -4 route show default | awk '/default/ {print $5; exit}')
+iptables -t nat -C PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667 2>/dev/null || \
+iptables -t nat -A PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
+ufw allow 6000:19999/udp >/dev/null 2>&1 || true
 
-# Add to users.json
-tmp=$(mktemp)
-jq --arg u "$USER" --arg p "$PASS" --arg e "$EXPIRES" \
-  '(. + [{"user":$u,"pass":$p,"expires":$e}]) | unique_by(.user)' \
-  /etc/zivpn/users.json >"$tmp" && mv "$tmp" /etc/zivpn/users.json
-
-# Ensure password inside config.json
-tmp=$(mktemp)
-jq --arg p "$PASS" 'if (.config // []) | index($p) then . else .config = ((.config // []) + [$p]) end' \
-  /etc/zivpn/config.json >"$tmp" && mv "$tmp" /etc/zivpn/config.json
-
-systemctl restart zivpn || true
-echo "✅ Added user $USER ($EXPIRES) with pass $PASS"
-SH
-chmod +x /usr/local/bin/add_zivpn_user
-# -------------------------------
+# Web port
+ufw allow ${WEBPORT}/tcp >/dev/null 2>&1 || true
 
 systemctl daemon-reload
-systemctl enable zivpn.service
-systemctl restart zivpn.service
+systemctl enable --now zivpn.service
+sleep 1
+systemctl enable --now zivpn-web.service
 
-# Firewall / NAT rules
-IFC=$(ip -4 route ls|grep default|awk '{print $5}'|head -1)
-iptables -t nat -A PREROUTING -i $IFC -p udp --dport 6000:19999 -j DNAT --to-destination :5667
-ufw allow 6000:19999/udp
-ufw allow 5667/udp
-
-echo -e "🎉 ZIVPN UDP Installed"
-echo -e "Use: sudo add_zivpn_user <user> <pass> <expires>"
+IP=$(curl -fsSL https://ifconfig.me || hostname -I | awk '{print $1}')
+echo
+echo "✅ DONE."
+echo "   - ZIVPN UDP  : udp://${IP}:5667"
+echo "   - Web panel  : http://${IP}:${WEBPORT}/"
+echo
+echo "Users file: $UJSON  (example entry)"
+cat <<'EX'
+[
+  {
+    "user": "demo",
+    "pass": "demo123",
+    "expires": "2025-12-31T23:59:59+07:00",
+    "port": 6001
+  }
+]
+EX
+SH
+bash /root/zivpn-allinone.sh
