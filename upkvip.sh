@@ -1,7 +1,7 @@
 #!/bin/bash
 # ZIVPN UDP Module + Web Panel (Myanmar UI)
 # Original: Zahid Islam | Tweaks & MM UI: U Phote Kaunt
-# Updates: apt-wait, download fallback, UFW 8080 allow (no other changes)
+# Patch: apt-wait + apt_pkg guard, download fallback, UFW 8080 allow, iproute2 (no other changes)
 
 set -e
 
@@ -10,7 +10,7 @@ B="\e[1;34m"; G="\e[1;32m"; Y="\e[1;33m"; R="\e[1;31m"; C="\e[1;36m"; M="\e[1;35
 LINE="${B}────────────────────────────────────────────────────────${Z}"
 say() { echo -e "$1"; }
 
-echo -e "\n$LINE\n${G}🌟 ZIVPN UDP Server ကို တပ်ဆင်နေပါတယ်...${Z}\n$LINE"
+echo -e "\n$LINE\n${G}🌟 ZIVPN UDP Server ကို U Phoe Kauntမှ ပြန်လည်ပြု့ပြင်ထားပါသည် တပ်ဆင်နေပါတယ်...${Z}\n$LINE"
 
 # ===== Pre-flight =====
 say "${C}🔑 Root အခွင့်အရေး 필요${Z}"
@@ -18,9 +18,9 @@ if [ "$(id -u)" -ne 0 ]; then
   echo -e "${R}ဤ script ကို root အဖြစ် chạy ရပါမယ် (sudo -i)${Z}"; exit 1
 fi
 
-# --- NEW: Wait for other apt processes to finish ---
+# --- apt guards: wait + disable noisy hooks (command-not-found/python3-apt) ---
 wait_for_apt() {
-  echo -e "${Y}⏳ apt တွေကို စောင့်နေပါတယ်... (${Z}apt-get/unattended-upgrades${Y})${Z}"
+  echo -e "${Y}⏳ apt ပိတ်မချင်း စောင့်နေပါတယ်...${Z}"
   for i in $(seq 1 60); do
     if pgrep -x apt-get >/dev/null || pgrep -x apt >/dev/null || pgrep -f 'apt.systemd.daily' >/dev/null || pgrep -x unattended-upgrade >/dev/null; then
       sleep 5
@@ -28,17 +28,44 @@ wait_for_apt() {
       return 0
     fi
   done
-  echo -e "${Y}⚠️ apt မပြီးသေးလို့ timers ကို ယာယီရပ်နေပါတယ်...${Z}"
+  echo -e "${Y}⚠️ apt မပြီးသေး — timers ကို ယာယီရပ်နေပါတယ်${Z}"
   systemctl stop --now unattended-upgrades.service 2>/dev/null || true
   systemctl stop --now apt-daily.service apt-daily.timer 2>/dev/null || true
   systemctl stop --now apt-daily-upgrade.service apt-daily-upgrade.timer 2>/dev/null || true
 }
-wait_for_apt
 
+apt_guard_start() {
+  wait_for_apt
+  CNF_CONF="/etc/apt/apt.conf.d/50command-not-found"
+  if [ -f "$CNF_CONF" ]; then
+    mv "$CNF_CONF" "${CNF_CONF}.disabled"
+    CNF_DISABLED=1
+  else
+    CNF_DISABLED=0
+  fi
+}
+
+apt_guard_end() {
+  dpkg --configure -a >/dev/null 2>&1 || true
+  apt-get -f install -y >/dev/null 2>&1 || true
+  if [ "${CNF_DISABLED:-0}" = "1" ] && [ -f "${CNF_CONF}.disabled" ]; then
+    mv "${CNF_CONF}.disabled" "$CNF_CONF"
+  fi
+}
+
+# ===== Packages (guarded) =====
 say "${Y}📦 Packages တွေ အပ်ဒိတ်လုပ်နေပါတယ်... (အချိန်ကြာနိုင်)${Z}"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null
-apt-get install -y curl ufw jq python3 python3-flask >/dev/null
+
+apt_guard_start
+apt-get update -y \
+  -o APT::Update::Post-Invoke-Success::= \
+  -o APT::Update::Post-Invoke::= >/dev/null
+apt-get install -y curl ufw jq python3 python3-flask python3-apt iproute2 >/dev/null || {
+  apt-get install -y -o DPkg::Lock::Timeout=60 python3-apt >/dev/null || true
+  apt-get install -y curl ufw jq python3 python3-flask iproute2 >/dev/null
+}
+apt_guard_end
 
 # Stop services to avoid 'text file busy'
 systemctl stop zivpn.service 2>/dev/null || true
@@ -82,7 +109,6 @@ read -r -p "Passwords (Enter ကို နှိပ်ရင် 'zi' သာ သ�
 if [ -z "$input_pw" ]; then
   PW_LIST='["zi"]'
 else
-  # normalize to JSON array
   PW_LIST=$(echo "$input_pw" | awk -F',' '{
     printf("["); for(i=1;i<=NF;i++){gsub(/^ *| *$/,"",$i); printf("%s\"%s\"", (i>1?",":""), $i)}; printf("]")
   }')
@@ -143,8 +169,7 @@ iptables -t nat -A PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to
 
 ufw allow 6000:19999/udp >/dev/null 2>&1 || true
 ufw allow 5667/udp >/dev/null 2>&1 || true
-# --- NEW: open Web Panel TCP 8080 ---
-ufw allow 8080/tcp >/dev/null 2>&1 || true
+ufw allow 8080/tcp >/dev/null 2>&1 || true   # for Web Panel
 
 # ===== Web Panel (Flask) =====
 say "${Y}🖥️ Web Panel (Flask) ကိုတပ်နေပါတယ်...${Z}"
