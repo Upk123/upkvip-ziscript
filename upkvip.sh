@@ -1,99 +1,96 @@
 #!/bin/bash
-# ZIVPN UDP Module + Web Panel + User Manager (Burmese Friendly)
-# Base by: Zahid Islam | Refactor: U Phote Kaunt (မြန်မာ UI/messages ထည့်သွင်း)
+# ZIVPN UDP Module + Web Panel (Myanmar UI)
+# Original: Zahid Islam | Tweaks & MM UI: U Phote Kaunt
 
-set -euo pipefail
+set -e
 
-green(){ echo -e "\e[92m$*\e[0m"; }
-yellow(){ echo -e "\e[93m$*\e[0m"; }
-red(){ echo -e "\e[91m$*\e[0m"; }
+# ===== Color Helpers =====
+B="\e[1;34m"; G="\e[1;32m"; Y="\e[1;33m"; R="\e[1;31m"; C="\e[1;36m"; M="\e[1;35m"; Z="\e[0m"
+LINE="${B}────────────────────────────────────────────────────────${Z}"
 
-green "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-green "   ✨ ZIVPN UDP Server ကို သန့်သန့်ရှင်းရှင်း အပြီးအစီးသွင်းနေပါပြီ"
-green "   • Web Panel (8080)   • Users/Expires  • Online/Offline"
-green "   • မြန်မာ UI messages"
-green "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+say() { echo -e "$1"; }
 
-# -------- 0) Basic deps
-yellow "🔧 Packages ရှာနေ/သွင်းနေ..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null
-apt-get install -y wget curl ufw openssl python3 python3-flask >/dev/null
+echo -e "\n$LINE\n${G}🌟 ZIVPN UDP Server ကို တပ်ဆင်နေပါတယ်...${Z}\n$LINE"
 
-# -------- 1) Install ZIVPN binary
-yellow "⬇️ ZIVPN binary ထည့်နေ..."
-install -d -m 755 /usr/local/bin
-wget -q https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64 -O /usr/local/bin/zivpn
-chmod +x /usr/local/bin/zivpn
-
-# -------- 2) Config folder + default config
-install -d -m 755 /etc/zivpn
-if [ ! -f /etc/zivpn/config.json ]; then
-  yellow "📄 default config.json ဆွဲယူနေ..."
-  if ! wget -q https://raw.githubusercontent.com/zahidbd2/udp-zivpn/main/config.json -O /etc/zivpn/config.json; then
-    # fallback very small config
-    cat >/etc/zivpn/config.json <<'CFG'
-{
-  "listen": ":5667",
-  "cert": "/etc/zivpn/zivpn.crt",
-  "key":  "/etc/zivpn/zivpn.key",
-  "obfs": "zivpn",
-  "auth": { "mode": "passwords", "config": ["zi"] },
-  "config": []
-}
-CFG
-  fi
+# ===== Pre-flight =====
+say "${C}🔑 Root အခွင့်အရေး 필요${Z}"
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "${R}ဤ script ကို root အဖြစ် chạy ရပါမယ် (sudo -i)${Z}"; exit 1
 fi
 
-# -------- 3) Certificates (self-signed)
+say "${Y}📦 Packages တွေ အပ်ဒိတ်လုပ်နေပါတယ်... (အချိန်ကြာနိုင်)${Z}"
+apt-get update -y >/dev/null
+apt-get install -y curl ufw jq python3 python3-flask >/dev/null
+
+# Stop services to avoid 'text file busy'
+systemctl stop zivpn.service 2>/dev/null || true
+systemctl stop zivpn-web.service 2>/dev/null || true
+
+# ===== Download / Install ZIVPN binary =====
+say "${Y}⬇️ ZIVPN binary ကို ဒေါင်းနေပါတယ်...${Z}"
+BIN_TMP="/usr/local/bin/zivpn.new"
+BIN="/usr/local/bin/zivpn"
+curl -fsSL -o "$BIN_TMP" "https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64"
+chmod +x "$BIN_TMP"
+mv -f "$BIN_TMP" "$BIN"
+
+# ===== Config folder =====
+mkdir -p /etc/zivpn
+
+# ===== Base config.json =====
+CFG="/etc/zivpn/config.json"
+if [ ! -f "$CFG" ]; then
+  say "${Y}🧩 မူရင်း config.json ကို ဖန်တီးနေပါတယ်...${Z}"
+  curl -fsSL -o "$CFG" "https://raw.githubusercontent.com/zahidbd2/udp-zivpn/main/config.json"
+fi
+
+# ===== Generate certs (once) =====
 if [ ! -f /etc/zivpn/zivpn.crt ] || [ ! -f /etc/zivpn/zivpn.key ]; then
-  yellow "🔐 ဆိုင်ဖာထုတ်စစ်လက်မှတ် files တည်ဆောက်နေ..."
+  say "${Y}🔐 SSL စိတျဖိုင်တွေ ဖန်တီးနေပါတယ်...${Z}"
   openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 \
-    -subj "/C=MM/ST=Yangon/L=Yangon/O=UPhoteKaunt/OU=ZIVPN/CN=zivpn" \
+    -subj "/C=MM/ST=Yangon/L=Yangon/O=UPK/OU=Net/CN=zivpn" \
     -keyout "/etc/zivpn/zivpn.key" -out "/etc/zivpn/zivpn.crt" >/dev/null 2>&1
 fi
 
-# -------- 4) Ask passwords -> write into config.json
-echo
-yellow "🔑 ZIVPN UDP စကားဝှက်များ ကိုမာများ (ဥပမာ: upkvip,alice,pass1)"
-read -rp "    မထည့်ရင် 'zi' ကို default ယူပါမယ်: " input_config || true
-
-if [ -n "${input_config:-}" ]; then
-  IFS=',' read -r -a config <<< "$input_config"
+# ===== Ask passwords for config.json =====
+say "${G}🔏 \"Password List\" ထည့်ပါ (ကော်မာဖြင့်ခွဲ) eg: upkvip,alice,pass1 ${Z}"
+read -r -p "Passwords (Enter ကို နှိပ်ရင် 'zi' သာ သုံးမယ်): " input_pw
+if [ -z "$input_pw" ]; then
+  PW_LIST='["zi"]'
 else
-  config=("zi")
+  # normalize to JSON array
+  PW_LIST=$(echo "$input_pw" | awk -F',' '{
+    printf("["); for(i=1;i<=NF;i++){gsub(/^ *| *$/,"",$i); printf("%s\"%s\"", (i>1?",":""), $i)}; printf("]")
+  }')
 fi
-# build JSON list
-pw_list=$(printf '"%s",' "${config[@]}" | sed 's/,$//')
 
-# Replace/ensure passwords array
-if grep -q '"auth"' /etc/zivpn/config.json; then
-  # replace whatever inside "config": [ ... ]
-  sed -i -E '0,/"auth"[^\}]*"config":[^\]]*\]/s//"auth": { "mode":"passwords", "config": ['"$pw_list"'] }/' /etc/zivpn/config.json
+# Update config.json: auth.config (password list)
+if jq . >/dev/null 2>&1 <<<'{}'; then
+  TMP=$(mktemp)
+  jq --argjson pw "$PW_LIST" '
+    .auth.mode = "passwords" |
+    .auth.config = $pw |
+    .listen = (."listen" // ":5667") |
+    .cert = "/etc/zivpn/zivpn.crt" |
+    .key  = "/etc/zivpn/zivpn.key" |
+    .obfs = "zivpn"
+  ' "$CFG" > "$TMP" && mv "$TMP" "$CFG"
 else
-  # append auth block
-  sed -i 's@^{@{ "auth": { "mode":"passwords","config": ['"$pw_list"'] }, @' /etc/zivpn/config.json
+  # jq မရှိသော်လည်း အရင်က sed fallback (already installed jq above)
+  :
+fi
+say "${G}✅ Password List ကို config.json ထဲသို့ ထည့်ပြီးပါပြီ${Z}"
+
+# ===== users.json (for Web Panel) =====
+USERS="/etc/zivpn/users.json"
+if [ ! -f "$USERS" ]; then
+  echo "[]" > "$USERS"
+  say "${C}📒 users.json ကို ဖန်တီးထားပြီးပါပြီ: $USERS ${Z}"
 fi
 
-# -------- 5) users.json (for panel) – create if missing, seed from passwords
-if [ ! -f /etc/zivpn/users.json ]; then
-  yellow "👥 users.json တည်ဆောက်နေ (expires 30 ရက်) ..."
-  exp=$(date -d '+30 days' -Iseconds 2>/dev/null || date -v+30d -Iseconds)
-  {
-    echo "["
-    n=${#config[@]}
-    for i in "${!config[@]}"; do
-      p="${config[$i]}"
-      printf '  {"user":"%s","pass":"%s","expires":"%s"}' "$p" "$p" "$exp"
-      if [ "$i" -lt $((n-1)) ]; then echo ","; else echo; fi
-    done
-    echo "]"
-  } > /etc/zivpn/users.json
-fi
-
-# -------- 6) systemd service (zivpn)
-yellow "🧩 systemd service တင်နေ..."
-cat >/etc/systemd/system/zivpn.service <<'UNIT'
+# ===== systemd service for ZIVPN =====
+say "${Y}🧰 systemd service (zivpn.service) ကို ထည့်နေပါတယ်...${Z}"
+cat >/etc/systemd/system/zivpn.service <<'EOF'
 [Unit]
 Description=ZIVPN UDP Server
 After=network.target
@@ -112,39 +109,136 @@ NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+EOF
 
 systemctl daemon-reload
-systemctl enable --now zivpn.service || true
+systemctl enable --now zivpn.service
+sleep 1
 
-# -------- 7) NAT + firewall
-yellow "🛡 firewall/NAT ပြင်နေ..."
+# ===== Port forward & firewall =====
 IFACE=$(ip -4 route ls | awk '/default/ {print $5; exit}')
 iptables -t nat -C PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667 2>/dev/null || \
 iptables -t nat -A PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
+
 ufw allow 6000:19999/udp >/dev/null 2>&1 || true
 ufw allow 5667/udp >/dev/null 2>&1 || true
 
-# -------- 8) Web Panel (Flask)
-yellow "🌐 Web Panel (8080) တပ်နေ..."
+# ===== Web Panel (Flask) =====
+say "${Y}🖥️ Web Panel (Flask) ကိုတပ်နေပါတယ်...${Z}"
 cat >/etc/zivpn/web.py <<'PY'
-from flask import Flask, jsonify, render_template_string
-import json, re, subprocess
+from flask import Flask, jsonify, render_template_string, request
+import json, re, subprocess, os
 
 USERS_FILE = "/etc/zivpn/users.json"
 
 HTML = """<!doctype html>
 <html lang="my"><head><meta charset="utf-8">
 <title>ZIVPN User Panel</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="10">
 <style>
-  body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;background:#fafafa}
-  h2{margin:0 0 12px}
-  .tip{color:#666;margin:6px 0 18px}
-  table{border-collapse:collapse;width:100%;max-width:820px;background:#fff}
-  th,td{border:1px solid #e5e5e5;padding:10px 12px;text-align:left}
-  th{background:#f6f8fa}
-  .ok{color:#0a0;font-weight:600}
+ body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}
+ h2{margin:0 0 12px}
+ .tip{color:#666;margin:6px 0 18px}
+ table{border-collapse:collapse;width:100%;max-width:860px}
+ th,td{border:1px solid #ddd;padding:8px;text-align:left}
+ th{background:#f5f5f5}
+ .ok{color:#0a0}.bad{color:#a00}.muted{color:#666}
+ .pill{display:inline-block;background:#eef;padding:3px 8px;border-radius:999px}
+ .btn{display:inline-block;padding:6px 10px;border:1px solid #ccc;border-radius:8px;text-decoration:none}
+ .btn:hover{background:#f8f8f8}
+</style></head><body>
+<h2>📒 ZIVPN User Panel</h2>
+<p class="tip">💡 အွန်လိုင်း/အော့ဖ်လိုင်းပြရန် <code>/etc/zivpn/users.json</code> ထဲမှာ user တစ်ယောက်စီအတွက် <code>port</code> ထည့်ပါ (UDP ဆာဗာသို့ scan လုပ်ပြီးစစ်တာ)။</p>
+<table>
+  <tr><th>👤 အသုံးပြုသူ</th><th>⏰ ကုန်ဆုံးရက်</th><th>🔌 အနေအထား</th></tr>
+  {% for u in users %}
+  <tr>
+    <td>{{u.user}}</td>
+    <td>{{u.expires}}</td>
+    <td>
+      {% if u.status == "Online" %}<span class="ok">Online</span>
+      {% elif u.status == "Offline" %}<span class="bad">Offline</span>
+      {% else %}<span class="muted">Unknown</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="tip">➕ အသုံးပြုသူအသစ်ထည့်ရန်: <span class="pill">/etc/zivpn/users.json</span> ကို တိုက်ရိုက်ပြင်ပြီး <span class="pill">systemctl restart zivpn-web</span> မလိုပါ—ဒီစာမျက်နှာက auto refresh ဖြစ်နေပါတယ်။</p>
+</body></html>"""
+
+app = Flask(__name__)
+
+def load_users():
+    try:
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def get_udp_ports():
+    # collect active/listening UDP ports (requires root)
+    out = subprocess.run("ss -uHapn", shell=True, capture_output=True, text=True).stdout
+    return set(re.findall(r":(\\d+)\\s", out))
+
+@app.route("/")
+def index():
+    users = load_users()
+    active = get_udp_ports()
+    view = []
+    for u in users:
+        port = str(u.get("port",""))
+        if port:
+            status = "Online" if port in active else "Offline"
+        else:
+            status = "Unknown"
+        view.append(type("U", (), {"user":u.get("user",""), "expires":u.get("expires",""), "status":status}))
+    view.sort(key=lambda x: x.user.lower())
+    return render_template_string(HTML, users=view)
+
+@app.route("/api/users")
+def api_users():
+    users = load_users()
+    active = get_udp_ports()
+    for u in users:
+        p = str(u.get("port",""))
+        u["status"] = ("Online" if p in active else ("Offline" if p else "Unknown"))
+    return jsonify(users)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+PY
+
+# systemd for web
+cat >/etc/systemd/system/zivpn-web.service <<'EOF'
+[Unit]
+Description=ZIVPN Web Panel
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /etc/zivpn/web.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now zivpn-web.service
+
+# ===== Done =====
+IP=$(hostname -I | awk '{print $1}')
+echo -e "\n$LINE\n${G}✅ အားလုံးပြီးပါပြီ!${Z}"
+echo -e "${C}• UDP Server   : ${M}running${Z}"
+echo -e "${C}• Web Panel    : ${Y}http://$IP:8080${Z}"
+echo -e "${C}• config.json  : ${Y}/etc/zivpn/config.json${Z}"
+echo -e "${C}• users.json   : ${Y}/etc/zivpn/users.json${Z}"
+echo -e "${C}• Service cmds : ${Y}systemctl status|restart zivpn (or) zivpn-web${Z}"
+echo -e "$LINE"  .ok{color:#0a0;font-weight:600}
   .bad{color:#c00;font-weight:600}
   .muted{color:#777}
   .brand{font-weight:700;background:linear-gradient(90deg,#0ea5e9,#22c55e);-webkit-background-clip:text;color:transparent}
