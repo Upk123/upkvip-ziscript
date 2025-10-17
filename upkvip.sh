@@ -1,62 +1,118 @@
-#!/bin/bash
-# Zivpn UDP Module installer
-# Creator Zahid Islam
+############################################
+# [ADD-ON] ZiVPN users with expiry (APPEND)
+############################################
 
-echo -e "Updating server"
-sudo apt-get update && apt-get upgrade -y
-systemctl stop zivpn.service 1> /dev/null 2> /dev/null
-echo -e "Downloading UDP Service"
-wget https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64 -O /usr/local/bin/zivpn 1> /dev/null 2> /dev/null
-chmod +x /usr/local/bin/zivpn
-mkdir /etc/zivpn 1> /dev/null 2> /dev/null
-wget https://raw.githubusercontent.com/zahidbd2/udp-zivpn/main/config.json -O /etc/zivpn/config.json 1> /dev/null 2> /dev/null
+# 0) ensure base dirs
+mkdir -p /etc/zivpn /etc/zivpn/backups
 
-echo "Generating cert files:"
-openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 -subj "/C=US/ST=California/L=Los Angeles/O=Example Corp/OU=IT Department/CN=zivpn" -keyout "/etc/zivpn/zivpn.key" -out "/etc/zivpn/zivpn.crt"
-sysctl -w net.core.rmem_max=16777216 1> /dev/null 2> /dev/null
-sysctl -w net.core.wmem_max=16777216 1> /dev/null 2> /dev/null
-cat <<EOF > /etc/systemd/system/zivpn.service
-[Unit]
-Description=zivpn VPN Server
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/etc/zivpn
-ExecStart=/usr/local/bin/zivpn server -c /etc/zivpn/config.json
-Restart=always
-RestartSec=3
-Environment=ZIVPN_LOG_LEVEL=info
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-echo -e "ZIVPN UDP Passwords"
-read -p "Enter passwords separated by commas, example: pass1,pass2 (Press enter for Default 'zi'): " input_config
-
-if [ -n "$input_config" ]; then
-    IFS=',' read -r -a config <<< "$input_config"
-    if [ ${#config[@]} -eq 1 ]; then
-        config+=(${config[0]})
-    fi
-else
-    config=("zi")
+# 1) users.json မရှိရင် ဖန်တီး (မနဲ့နေတဲ့ sample ၁ခု)
+if [ ! -f /etc/zivpn/users.json ]; then
+  cat >/etc/zivpn/users.json <<'JSON'
+[
+  { "user": "demo", "pass": "demo123", "expires": "2025-12-31T23:59:59+07:00" }
+]
+JSON
+  chmod 600 /etc/zivpn/users.json
 fi
 
-new_config_str="\"config\": [$(printf "\"%s\"," "${config[@]}" | sed 's/,$//')]"
+# 2) updater script — users.json ထဲက expiry မကုန်သေးတဲ့ password တွေကို
+#    /etc/zivpn/config.json ရဲ့ "auth.config" ထဲ update လုပ်ပေးမယ်
+cat >/usr/local/bin/zivpn-update.sh <<'PYSH'
+#!/bin/bash
+set -euo pipefail
+USERS="/etc/zivpn/users.json"
+CONF="/etc/zivpn/config.json"
+BACKUP_DIR="/etc/zivpn/backups"
+mkdir -p "$BACKUP_DIR"
+cp -a "$CONF" "$BACKUP_DIR/config.json.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
 
-sed -i -E "s/\"config\": ?\[[[:space:]]*\"zi\"[[:space:]]*\]/${new_config_str}/g" /etc/zivpn/config.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+from datetime import datetime, timezone
 
+USERS = Path("/etc/zivpn/users.json")
+CONF  = Path("/etc/zivpn/config.json")
+now = datetime.now(timezone.utc)
 
-systemctl enable zivpn.service
-systemctl start zivpn.service
-iptables -t nat -A PREROUTING -i $(ip -4 route ls|grep default|grep -Po '(?<=dev )(\S+)'|head -1) -p udp --dport 6000:19999 -j DNAT --to-destination :5667
-ufw allow 6000:19999/udp
-ufw allow 5667/udp
-rm zi.* 1> /dev/null 2> /dev/null
-echo -e "ZIVPN UDP Installed"
+def parse_iso(s: str):
+    if not s: return None
+    s = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+# load users
+users = []
+try:
+    users = json.loads(USERS.read_text(encoding="utf-8"))
+except Exception:
+    users = []
+
+# keep only non-expired passwords
+active_passwords = []
+for u in users:
+    exp = parse_iso(u.get("expires"))
+    if exp and exp > now:
+        pw = u.get("pass") or ""
+        if pw:
+            active_passwords.append(pw)
+
+# load config and update auth.config
+try:
+    data = json.loads(CONF.read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+auth = data.get("auth", {})
+auth["mode"] = "passwords"
+auth["config"] = active_passwords
+data["auth"] = auth
+CONF.write_text(json.dumps(data, indent=2), encoding="utf-8")
+PY
+
+# service reload (best-effort)
+systemctl restart zivpn.service >/dev/null 2>&1 || true
+PYSH
+chmod +x /usr/local/bin/zivpn-update.sh
+
+# 3) add-user helper — command တစ်ကြောင်းနဲ့ user အသစ် + expiry ထည့်ပြီး update လုပ်မယ်
+cat >/usr/local/bin/zivpn-add-user <<'SH'
+#!/bin/bash
+# Usage: zivpn-add-user <username> <password> <expiry-ISO8601>
+# Example: zivpn-add-user upkvip upkvip '2025-11-01T23:59:59+07:00'
+set -euo pipefail
+if [ $# -lt 3 ]; then
+  echo "Usage: $0 <username> <password> <expiry-ISO8601>"
+  exit 2
+fi
+U="$1"; P="$2"; E="$3"
+JSON_FILE="/etc/zivpn/users.json"
+TMP=$(mktemp)
+
+python3 - <<PY
+import json,sys
+from pathlib import Path
+p=Path("$JSON_FILE")
+arr=[]
+if p.exists():
+    try: arr=json.loads(p.read_text())
+    except Exception: arr=[]
+arr.append({"user":"$U","pass":"$P","expires":"$E"})
+p.write_text(json.dumps(arr,indent=2))
+PY
+
+/usr/local/bin/zivpn-update.sh
+echo "Added user: $U (expires $E)"
+SH
+chmod +x /usr/local/bin/zivpn-add-user
+
+# 4) run once now to sync config.json
+/usr/local/bin/zivpn-update.sh
+
+# 5) hourly auto-refresh (expired တွေကို အလိုအလျောက် ဖယ်)
+( crontab -l 2>/dev/null | grep -v 'zivpn-update.sh'; echo "0 * * * * /usr/local/bin/zivpn-update.sh >/var/log/zivpn-update.log 2>&1" ) | crontab -
+
+echo "✅ Expiry add-on installed. Add users with:  zivpn-add-user <user> <pass> <ISO8601>"
+############################################
