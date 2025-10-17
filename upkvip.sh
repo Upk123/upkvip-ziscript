@@ -1,118 +1,118 @@
-############################################
-# [ADD-ON] ZiVPN users with expiry (APPEND)
-############################################
-
-# 0) ensure base dirs
-mkdir -p /etc/zivpn /etc/zivpn/backups
-
-# 1) users.json မရှိရင် ဖန်တီး (မနဲ့နေတဲ့ sample ၁ခု)
-if [ ! -f /etc/zivpn/users.json ]; then
-  cat >/etc/zivpn/users.json <<'JSON'
-[
-  { "user": "demo", "pass": "demo123", "expires": "2025-12-31T23:59:59+07:00" }
-]
-JSON
-  chmod 600 /etc/zivpn/users.json
+# ===== ZIVPN Web Panel (Users + Online/Offline) =====
+# deps
+if ! command -v flask >/dev/null 2>&1; then
+  apt-get update 2>/dev/null || true
+  apt-get install -y python3-flask curl || true
 fi
 
-# 2) updater script — users.json ထဲက expiry မကုန်သေးတဲ့ password တွေကို
-#    /etc/zivpn/config.json ရဲ့ "auth.config" ထဲ update လုပ်ပေးမယ်
-cat >/usr/local/bin/zivpn-update.sh <<'PYSH'
-#!/bin/bash
-set -euo pipefail
-USERS="/etc/zivpn/users.json"
-CONF="/etc/zivpn/config.json"
-BACKUP_DIR="/etc/zivpn/backups"
-mkdir -p "$BACKUP_DIR"
-cp -a "$CONF" "$BACKUP_DIR/config.json.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+# web app
+cat >/etc/zivpn/web.py <<'PY'
+from flask import Flask, jsonify, render_template_string
+import json, re, subprocess, os
 
-python3 - <<'PY'
-import json
-from pathlib import Path
-from datetime import datetime, timezone
+USERS_FILE = "/etc/zivpn/users.json"
 
-USERS = Path("/etc/zivpn/users.json")
-CONF  = Path("/etc/zivpn/config.json")
-now = datetime.now(timezone.utc)
+HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<title>ZIVPN User Panel</title>
+<meta http-equiv="refresh" content="10">
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}
+table{border-collapse:collapse;width:100%;max-width:720px}
+th,td{border:1px solid #ddd;padding:8px;text-align:left}
+th{background:#f5f5f5}
+.ok{color:#0a0}
+.bad{color:#a00}
+.muted{color:#666}
+</style></head><body>
+<h2>ZIVPN User Panel</h2>
+<table>
+  <tr><th>User</th><th>Expires</th><th>Status</th></tr>
+  {% for u in users %}
+  <tr>
+    <td>{{u.user}}</td>
+    <td>{{u.expires}}</td>
+    <td>
+      {% if u.status == "Online" %}<span class="ok">Online</span>
+      {% elif u.status == "Offline" %}<span class="bad">Offline</span>
+      {% else %}<span class="muted">Unknown</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+</body></html>"""
 
-def parse_iso(s: str):
-    if not s: return None
-    s = s.replace("Z", "+00:00")
+app = Flask(__name__)
+
+def load_users():
     try:
-        dt = datetime.fromisoformat(s)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        with open(USERS_FILE,"r") as f:
+            return json.load(f)
     except Exception:
-        return None
+        return []
 
-# load users
-users = []
-try:
-    users = json.loads(USERS.read_text(encoding="utf-8"))
-except Exception:
-    users = []
+def get_udp_ports():
+    # ss -uapn (needs root) -> collect listening/active UDP ports
+    out = subprocess.run("ss -uHapn", shell=True, capture_output=True, text=True).stdout
+    return set(re.findall(r":(\\d+)\\s", out))
 
-# keep only non-expired passwords
-active_passwords = []
-for u in users:
-    exp = parse_iso(u.get("expires"))
-    if exp and exp > now:
-        pw = u.get("pass") or ""
-        if pw:
-            active_passwords.append(pw)
+@app.route("/")
+def index():
+    users = load_users()
+    active = get_udp_ports()
+    view = []
+    for u in users:
+        port = str(u.get("port",""))
+        if port:
+            status = "Online" if port in active else "Offline"
+        else:
+            status = "Unknown"
+        view.append(type("U", (), {"user":u.get("user",""), "expires":u.get("expires",""), "status":status}))
+    # sort by user name
+    view.sort(key=lambda x: x.user.lower())
+    return render_template_string(HTML, users=view)
 
-# load config and update auth.config
-try:
-    data = json.loads(CONF.read_text(encoding="utf-8"))
-except Exception:
-    data = {}
-auth = data.get("auth", {})
-auth["mode"] = "passwords"
-auth["config"] = active_passwords
-data["auth"] = auth
-CONF.write_text(json.dumps(data, indent=2), encoding="utf-8")
+@app.route("/api/users")
+def api_users():
+    users = load_users()
+    active = get_udp_ports()
+    for u in users:
+        p = str(u.get("port",""))
+        u["status"] = ("Online" if p in active else ("Offline" if p else "Unknown"))
+    return jsonify(users)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
 PY
 
-# service reload (best-effort)
-systemctl restart zivpn.service >/dev/null 2>&1 || true
-PYSH
-chmod +x /usr/local/bin/zivpn-update.sh
+# small static index for sanity check
+cat >/etc/zivpn/index.html <<'HTML'
+<!doctype html><meta charset="utf-8"><title>ZIVPN</title>
+<p>OK - ZIVPN web is installed. Go to <a href="/">/</a>.</p>
+HTML
 
-# 3) add-user helper — command တစ်ကြောင်းနဲ့ user အသစ် + expiry ထည့်ပြီး update လုပ်မယ်
-cat >/usr/local/bin/zivpn-add-user <<'SH'
-#!/bin/bash
-# Usage: zivpn-add-user <username> <password> <expiry-ISO8601>
-# Example: zivpn-add-user upkvip upkvip '2025-11-01T23:59:59+07:00'
-set -euo pipefail
-if [ $# -lt 3 ]; then
-  echo "Usage: $0 <username> <password> <expiry-ISO8601>"
-  exit 2
-fi
-U="$1"; P="$2"; E="$3"
-JSON_FILE="/etc/zivpn/users.json"
-TMP=$(mktemp)
+# systemd service
+cat >/etc/systemd/system/zivpn-web.service <<'UNIT'
+[Unit]
+Description=ZIVPN Web Monitor
+After=network.target
 
-python3 - <<PY
-import json,sys
-from pathlib import Path
-p=Path("$JSON_FILE")
-arr=[]
-if p.exists():
-    try: arr=json.loads(p.read_text())
-    except Exception: arr=[]
-arr.append({"user":"$U","pass":"$P","expires":"$E"})
-p.write_text(json.dumps(arr,indent=2))
-PY
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /etc/zivpn/web.py
+Restart=always
+RestartSec=3
 
-/usr/local/bin/zivpn-update.sh
-echo "Added user: $U (expires $E)"
-SH
-chmod +x /usr/local/bin/zivpn-add-user
+[Install]
+WantedBy=multi-user.target
+UNIT
 
-# 4) run once now to sync config.json
-/usr/local/bin/zivpn-update.sh
-
-# 5) hourly auto-refresh (expired တွေကို အလိုအလျောက် ဖယ်)
-( crontab -l 2>/dev/null | grep -v 'zivpn-update.sh'; echo "0 * * * * /usr/local/bin/zivpn-update.sh >/var/log/zivpn-update.log 2>&1" ) | crontab -
-
-echo "✅ Expiry add-on installed. Add users with:  zivpn-add-user <user> <pass> <ISO8601>"
-############################################
+# firewall + enable
+ufw allow 8080/tcp >/dev/null 2>&1 || true
+systemctl daemon-reload
+systemctl enable --now zivpn-web
+echo "✅ Web panel is running on http://<YOUR_IP>:8080"
+echo "   Note: Put a 'port' for each user in /etc/zivpn/users.json to see Online/Offline."
+# ===== end web panel block =====
