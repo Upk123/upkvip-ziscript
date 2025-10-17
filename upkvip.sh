@@ -1,4 +1,5 @@
 # ===== ZIVPN Web Panel (Users + Online/Offline) =====
+
 # deps
 if ! command -v flask >/dev/null 2>&1; then
   apt-get update 2>/dev/null || true
@@ -8,7 +9,7 @@ fi
 # web app
 cat >/etc/zivpn/web.py <<'PY'
 from flask import Flask, jsonify, render_template_string
-import json, re, subprocess, os
+import json, re, subprocess
 
 USERS_FILE = "/etc/zivpn/users.json"
 
@@ -53,7 +54,6 @@ def load_users():
         return []
 
 def get_udp_ports():
-    # ss -uapn (needs root) -> collect listening/active UDP ports
     out = subprocess.run("ss -uHapn", shell=True, capture_output=True, text=True).stdout
     return set(re.findall(r":(\\d+)\\s", out))
 
@@ -69,7 +69,6 @@ def index():
         else:
             status = "Unknown"
         view.append(type("U", (), {"user":u.get("user",""), "expires":u.get("expires",""), "status":status}))
-    # sort by user name
     view.sort(key=lambda x: x.user.lower())
     return render_template_string(HTML, users=view)
 
