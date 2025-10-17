@@ -1,129 +1,96 @@
-bash -c "$(curl -fsSL https://gist.githubusercontent.com/anonymous/0/raw/zivpn-allinone.sh)" || cat <<'SH' > /root/zivpn-allinone.sh
-#!/usr/bin/env bash
-set -euo pipefail
+# 1) backup
+sudo cp -a /etc/zivpn/web.py /etc/zivpn/web.py.bak.$(date +%F-%H%M) 2>/dev/null || true
 
-# ---------- sanity ----------
-[[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }
-
-echo "[1/8] Install deps"
-apt-get update -y
-apt-get install -y curl ca-certificates python3 python3-flask ufw
-
-# ---------- paths ----------
-ZDIR=/etc/zivpn
-BIN=/usr/local/bin/zivpn
-CONF=$ZDIR/config.json
-CRT=$ZDIR/zivpn.crt
-KEY=$ZDIR/zivpn.key
-UJSON=$ZDIR/users.json
-WEB=$ZDIR/web.py
-WEBUNIT=/etc/systemd/system/zivpn-web.service
-SVUNIT=/etc/systemd/system/zivpn.service
-
-mkdir -p "$ZDIR"
-
-echo "[2/8] Install ZIVPN binary"
-curl -fsSL https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64 -o "$BIN"
-chmod +x "$BIN"
-
-echo "[3/8] Make/keep config.json"
-if [[ ! -f "$CONF" ]]; then
-  cat > "$CONF" <<JSON
-{
-  "listen": ":5667",
-  "cert": "$CRT",
-  "key": "$KEY",
-  "obfs": "zivpn",
-  "auth": {
-    "mode": "passwords",
-    "config": [ "zi" ]
-  }
-}
-JSON
-fi
-
-echo "[4/8] Generate TLS cert if missing"
-if [[ ! -f "$CRT" || ! -f "$KEY" ]]; then
-  openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 \
-   -subj "/C=US/ST=CA/L=LA/O=ZIVPN/OU=IT/CN=zivpn" \
-   -keyout "$KEY" -out "$CRT"
-fi
-
-echo "[5/8] Prompt & update passwords in config.json"
-read -rp "Enter passwords (comma-separated) [default: zi]: " INPUT || true
-INPUT="${INPUT:-zi}"
-python3 - <<PY
-import json,sys
-p="$CONF"
-cfg=json.load(open(p))
-cfg.setdefault("auth",{}).setdefault("config",[])
-cfg["auth"]["mode"]="passwords"
-cfg["auth"]["config"]=[s.strip() for s in "$INPUT".split(",") if s.strip()]
-open(p,"w").write(json.dumps(cfg,indent=2))
-print("Saved passwords:", cfg["auth"]["config"])
-PY
-
-echo "[6/8] Systemd service for ZIVPN"
-cat > "$SVUNIT" <<'UNIT'
-[Unit]
-Description=ZIVPN UDP Server
-After=network.target
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/etc/zivpn
-ExecStart=/usr/local/bin/zivpn server -c /etc/zivpn/config.json
-Restart=always
-RestartSec=3
-Environment=ZIVPN_LOG_LEVEL=info
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-echo "[7/8] Web panel"
-# pick web port
-WEBPORT=8080
-if ss -ltn '( sport = :8080 )' | grep -q LISTEN; then WEBPORT=8081; fi
-
-cat > "$WEB" <<'PY'
-from flask import Flask, jsonify, render_template_string
+# 2) write new web.py with Myanmar UI + Text view
+sudo tee /etc/zivpn/web.py >/dev/null <<'PY'
+from flask import Flask, jsonify, render_template_string, Response
 import json, re, subprocess, os
 
 USERS_FILE = "/etc/zivpn/users.json"
 
-HTML = """<!doctype html><meta charset="utf-8">
+HTML = """<!doctype html>
+<html lang="my"><head><meta charset="utf-8">
 <title>ZIVPN User Panel</title>
 <meta http-equiv="refresh" content="10">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Myanmar:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
-body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}
-table{border-collapse:collapse;width:100%;max-width:820px}
-th,td{border:1px solid #ddd;padding:8px;text-align:left}
-th{background:#f5f5f5}
-.ok{color:#0a0}.bad{color:#a00}.muted{color:#666}
-</style>
-<h2>ZIVPN User Panel</h2>
-<table>
-<tr><th>User</th><th>Expires</th><th>Status</th></tr>
-{% if not users %}<tr><td colspan=3 class="muted">
-No users in /etc/zivpn/users.json
-</td></tr>{% endif %}
-{% for u in users %}
-<tr>
-  <td>{{u.user}}</td>
-  <td>{{u.expires}}</td>
-  <td>
-    {% if u.status == "Online" %}<span class="ok">Online</span>
-    {% elif u.status == "Offline" %}<span class="bad">Offline</span>
-    {% else %}<span class="muted">Unknown</span>{% endif %}
-  </td>
-</tr>
-{% endfor %}
-</table>
-<p class="muted">Tip: If you set a dedicated UDP client port for a user,
-add it as <code>"port": 6001</code> in users.json to enable best-effort status.</p>
+:root{
+  --bg:#0f172a; --card:#111827; --muted:#9ca3af; --ok:#22c55e; --bad:#ef4444; --acc:#38bdf8;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; padding:0 20px 40px;
+  font-family:"Noto Sans Myanmar", system-ui, Segoe UI, Roboto, Arial, "Myanmar Sans Pro";
+  color:#e5e7eb; background:linear-gradient(180deg,#0b1220, #0f172a 60%, #0b1220);
+}
+.header{
+  max-width:980px; margin:24px auto;
+  background:linear-gradient(135deg,#0ea5e9 0%,#22c55e 100%);
+  color:#0b1220; border-radius:18px; padding:18px 20px; box-shadow:0 10px 30px rgba(0,0,0,.25);
+}
+.h-title{font-size:28px; font-weight:800; letter-spacing:.3px}
+.h-sub{opacity:.9; margin-top:6px}
+.badge{display:inline-block; font-size:12px; padding:4px 10px; border-radius:999px; background:#0b1220; color:#a7f3d0; margin-left:8px}
+
+.card{max-width:980px; margin:18px auto; background:var(--card); border:1px solid rgba(255,255,255,.06); border-radius:16px; overflow:hidden}
+.tbl{width:100%; border-collapse:collapse}
+.tbl th,.tbl td{padding:10px 12px; border-bottom:1px solid rgba(255,255,255,.06); text-align:left}
+.tbl th{background:#0b1220; color:#cbd5e1; font-weight:700}
+.status-ok{color:var(--ok); font-weight:700}
+.status-bad{color:var(--bad); font-weight:700}
+.status-mut{color:var(--muted); font-weight:600}
+.note{max-width:980px; margin:8px auto 0; color:var(--muted); font-size:13px}
+.actions{max-width:980px; margin:10px auto 0; display:flex; gap:10px; flex-wrap:wrap}
+.btn{border:1px solid rgba(255,255,255,.12); background:#0b1220; color:#cbd5e1; padding:8px 12px; border-radius:10px; text-decoration:none}
+.btn:hover{border-color:#38bdf8; color:#e0f2fe}
+.footer{max-width:980px; margin:20px auto 0; color:#94a3b8; font-size:12px}
+.brand{color:#e2f0ff; font-weight:700}
+</style></head>
+<body>
+  <div class="header">
+    <div class="h-title">ZIVPN VPN (UDP) — Control Panel
+      <span class="badge">U Phue Kaunt မှ ပြန်လည် ပြုစုပြင်ဆင်ရေးသားထားသည်</span>
+    </div>
+    <div class="h-sub">တင်ထားသော အသုံးပြုသူများ၏ သက်တမ်း/အွန်လိုင်းအခြေအနေ ကို မိနစ်တိုင်း အလိုအလျောက် ပြန်လည် تازهတင် ပြသပေးပါသည်။</div>
+  </div>
+
+  <div class="card">
+    <table class="tbl">
+      <tr>
+        <th style="width:32%">👤 အသုံးပြုသူ (User)</th>
+        <th style="width:38%">⏳ သက်တမ်းကုန်ချိန် (Expires)</th>
+        <th>📶 အခြေအနေ (Status)</th>
+      </tr>
+      {% if not users %}
+      <tr><td colspan="3" class="status-mut">/etc/zivpn/users.json ထဲတွင် user မရှိသေးပါ — ဥပမာ
+      {"user":"demo","pass":"demo123","expires":"2026-12-31T23:59:59+07:00","port":6001}</td></tr>
+      {% endif %}
+      {% for u in users %}
+      <tr>
+        <td>{{u.user}}</td>
+        <td>{{u.expires}}</td>
+        <td>
+          {% if u.status=="Online" %}<span class="status-ok">Online</span>
+          {% elif u.status=="Offline" %}<span class="status-bad">Offline</span>
+          {% else %}<span class="status-mut">Unknown</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="actions">
+    <a class="btn" href="/text">📝 Text View (မြန်မာ)</a>
+    <a class="btn" href="/api/users">🔗 JSON API</a>
+  </div>
+
+  <div class="note">မှတ်ချက် — အွန်လိုင်း/အော့ဖ်လိုင်း ကို တိတိကျကျ ပြချင်ရင် users.json ထဲတွင်
+  <b>"port": 6001</b> စသည်ဖြင့် client သုံးမယ့် UDP port ကို သတ်မှတ်ပေးပါ။</div>
+
+  <div class="footer">© ZIVPN • Crafted with <span class="brand">U Phue Kaunt</span></div>
+</body></html>
 """
 
 app = Flask(__name__)
@@ -137,7 +104,7 @@ def load_users():
 
 def get_udp_ports():
     out = subprocess.run("ss -uHapn", shell=True, capture_output=True, text=True).stdout
-    return set(re.findall(r":(\\d+)\\s", out))
+    return set(re.findall(r":(\d+)\s", out))
 
 @app.route("/")
 def index():
@@ -146,16 +113,12 @@ def index():
     view = []
     for u in users:
         port = str(u.get("port",""))
-        status = "Unknown"
         if port:
             status = "Online" if port in active else "Offline"
-        view.append(type("U", (), {
-            "user": u.get("user",""),
-            "expires": u.get("expires",""),
-            "status": status
-        }))
+        else:
+            status = "Unknown"
+        view.append(type("U", (), {"user":u.get("user",""), "expires":u.get("expires",""), "status":status}))
     view.sort(key=lambda x: x.user.lower())
-    from flask import render_template_string
     return render_template_string(HTML, users=view)
 
 @app.route("/api/users")
@@ -167,65 +130,31 @@ def api_users():
         u["status"] = ("Online" if p in active else ("Offline" if p else "Unknown"))
     return jsonify(users)
 
+# ➕ Text view in Burmese
+@app.route("/text")
+def text_view():
+    users = load_users()
+    active = get_udp_ports()
+    lines = ["ZIVPN (UDP) — မြန်မာ Text View",
+             "U Phue Kaunt မှ ပြန်လည် ပြုစုပြင်ဆင်ရေးသားထားသည်",
+             "---------------------------------------"]
+    if not users:
+        lines.append("users.json တွင် user မရှိသေးပါ")
+    for u in users:
+        name = u.get("user","")
+        exp  = u.get("expires","")
+        p    = str(u.get("port",""))
+        st   = ("Online" if (p and p in active) else ("Offline" if p else "Unknown"))
+        lines.append(f"👤 {name} | ⏳ {exp} | 📶 {st}")
+    txt = "\n".join(lines) + "\n"
+    return Response(txt, mimetype="text/plain; charset=utf-8")
+
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT","8080"))
     app.run(host="0.0.0.0", port=port)
 PY
 
-cat > "$WEBUNIT" <<UNIT
-[Unit]
-Description=ZIVPN Web Monitor
-After=network.target
-[Service]
-Type=simple
-User=root
-Environment=PORT=$WEBPORT
-ExecStart=/usr/bin/python3 $WEB
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# users.json bootstrap
-if [[ ! -f "$UJSON" ]]; then
-  echo "[]" > "$UJSON"
-fi
-
-echo "[8/8] Firewall & start services"
-# UDP service
-ufw allow 5667/udp >/dev/null 2>&1 || true
-# Optional DNAT fan-in ports
-IFACE=$(ip -4 route show default | awk '/default/ {print $5; exit}')
-iptables -t nat -C PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667 2>/dev/null || \
-iptables -t nat -A PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
-ufw allow 6000:19999/udp >/dev/null 2>&1 || true
-
-# Web port
-ufw allow ${WEBPORT}/tcp >/dev/null 2>&1 || true
-
-systemctl daemon-reload
-systemctl enable --now zivpn.service
-sleep 1
-systemctl enable --now zivpn-web.service
-
-IP=$(curl -fsSL https://ifconfig.me || hostname -I | awk '{print $1}')
-echo
-echo "✅ DONE."
-echo "   - ZIVPN UDP  : udp://${IP}:5667"
-echo "   - Web panel  : http://${IP}:${WEBPORT}/"
-echo
-echo "Users file: $UJSON  (example entry)"
-cat <<'EX'
-[
-  {
-    "user": "demo",
-    "pass": "demo123",
-    "expires": "2025-12-31T23:59:59+07:00",
-    "port": 6001
-  }
-]
-EX
-SH
-bash /root/zivpn-allinone.sh
+# 3) restart web service
+sudo systemctl daemon-reload
+sudo systemctl restart zivpn-web
+sudo systemctl status zivpn-web --no-pager -n 10
