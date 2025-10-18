@@ -1,9 +1,10 @@
 #!/bin/bash
 # ZIVPN UDP Module + Web Panel (Myanmar UI)
 # Original: Zahid Islam | Tweaks & MM UI: U Phote Kaunt
-# Patch: apt-wait + apt_pkg guard, download fallback, UFW 8080 allow, iproute2
+# Patch: apt-wait + apt_pkg guard, download fallback, UFW 8080 allow, iproute2, conntrack
 # Extra: Live per-user Online/Offline via conntrack + users.json <-> config.json sync
 # Extra fix: Add User POST => render immediately (no redirect) + CRLF sanitize + safe heredocs
+# Extra++: DNAT (6000–19999/udp ⇒ :5667) + UDP/conntrack hardening + iptables persist + Web 120s refresh
 
 set -e
 
@@ -60,9 +61,9 @@ say "${Y}📦 Packages တွေ အပ်ဒိတ်လုပ်နေပါ�
 export DEBIAN_FRONTEND=noninteractive
 apt_guard_start
 apt-get update -y -o APT::Update::Post-Invoke-Success::= -o APT::Update::Post-Invoke::= >/dev/null
-apt-get install -y curl ufw jq python3 python3-flask python3-apt iproute2 conntrack >/dev/null || {
+apt-get install -y curl ufw jq python3 python3-flask python3-apt iproute2 conntrack iptables-persistent >/dev/null || {
   apt-get install -y -o DPkg::Lock::Timeout=60 python3-apt >/dev/null || true
-  apt-get install -y curl ufw jq python3 python3-flask iproute2 conntrack >/dev/null
+  apt-get install -y curl ufw jq python3 python3-flask iproute2 conntrack iptables-persistent >/dev/null
 }
 apt_guard_end
 
@@ -154,6 +155,40 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
+# ===== Port forward & firewall =====
+say "${Y}🛡️ UDP DNAT rule + UFW allow သတ်မှတ်နေပါတယ်...${Z}"
+IFACE=$(ip -4 route ls | awk '/default/ {print $5; exit}')
+iptables -t nat -C PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667 2>/dev/null || \
+iptables -t nat -A PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
+ufw allow 6000:19999/udp >/dev/null 2>&1 || true
+ufw allow 5667/udp >/dev/null 2>&1 || true
+ufw allow 8080/tcp >/dev/null 2>&1 || true
+# Persist iptables rules across reboot
+netfilter-persistent save >/dev/null 2>&1 || true
+
+# ===== Network hardening (UDP/conntrack) =====
+say "${Y}⚙️ UDP/conntrack hardening ကို လုပ်နေပါတယ်...${Z}"
+cat >/etc/sysctl.d/90-zivpn-udp.conf <<'EOF'
+net.netfilter.nf_conntrack_udp_timeout=300
+net.netfilter.nf_conntrack_udp_timeout_stream=600
+EOF
+cat >/etc/sysctl.d/90-zivpn-conntrack-size.conf <<'EOF'
+net.netfilter.nf_conntrack_max=262144
+EOF
+cat >/etc/sysctl.d/90-zivpn-sock.conf <<'EOF'
+net.core.rmem_max=26214400
+net.core.wmem_max=26214400
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+EOF
+# Enable IP forward (safe for UDP NAT)
+sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+# Apply all sysctl
+sysctl --system >/dev/null || true
+
 # ===== Web Panel (Flask) =====
 say "${Y}🖥️ Web Panel (Flask) ကိုတပ်နေပါတယ်...${Z}"
 cat > /etc/zivpn/web.py <<'PY'
@@ -170,7 +205,7 @@ HTML = """<!doctype html>
 <html lang="my"><head><meta charset="utf-8">
 <title>ZIVPN User Panel</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="10">
+<meta http-equiv="refresh" content="120">
 <style>
  body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}
  h2{margin:0 0 12px}
@@ -189,7 +224,7 @@ HTML = """<!doctype html>
  .err{margin:10px 0;color:#a00}
 </style></head><body>
 <h2>📒 ZIVPN User Panel</h2>
-<p class="tip">users.json ⇄ config.json(auth.config) ကို auto-sync လုပ်ထားပြီး၊ Online/Offline ကို UDP activity (conntrack) နဲ့ စစ်၊ LISTEN ကို fallback လုပ်ပါတယ် (10s auto refresh).</p>
+<p class="tip">users.json ⇄ config.json(auth.config) ကို auto-sync လုပ်ထားပြီး၊ Online/Offline ကို UDP activity (conntrack) နဲ့ စစ်၊ LISTEN ကို fallback လုပ်ပါတယ် (refresh 120s).</p>
 
 <form method="post" action="/add">
   <h3>➕ အသုံးပြုသူ အသစ်ထည့်ရန်</h3>
@@ -454,6 +489,7 @@ IP=$(hostname -I | awk '{print $1}')
 echo -e "\n$LINE\n${G}✅ အားလုံးပြီးပါပြီ!${Z}"
 echo -e "${C}• UDP Server   : ${M}running${Z}"
 echo -e "${C}• Web Panel    : ${Y}http://$IP:8080${Z}"
+echo -e "${C}• DNAT rule    : ${Y}6000–19999/udp ⇒ :5667 (iptables nat, persisted)${Z}"
 echo -e "${C}• config.json  : ${Y}/etc/zivpn/config.json${Z}"
 echo -e "${C}• users.json   : ${Y}/etc/zivpn/users.json${Z}"
 echo -e "${C}• Service cmds : ${Y}systemctl status|restart zivpn (or) zivpn-web${Z}"
