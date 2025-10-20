@@ -7,19 +7,18 @@
 set -euo pipefail
 
 # ===== Defaults =====
-SECRET="changeme"                  # X-Admin-Secret for /api/generate
-PORT="8088"                        # Web/API port
-DB="/var/lib/upkapi/keys.db"       # SQLite DB path
-BIND="0.0.0.0"                     # Bind address
-APPDIR="/opt/zi-keyapi"            # App dir
-ENVF="/etc/default/zi-keyapi"      # Environment file
+SECRET="changeme"                       # X-Admin-Secret (for /api/generate)
+PORT="8088"                             # Web/API port
+DB="/var/lib/upkapi/keys.db"            # SQLite DB
+BIND="0.0.0.0"                          # Bind address
+APPDIR="/opt/zi-keyapi"                 # App dir
+ENVF="/etc/default/zi-keyapi"           # Environment file used by systemd
 UNIT="/etc/systemd/system/zi-keyapi.service"
 LOGO_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png"
 
 # ===== Parse args =====
 ACTION=""
-CLI_USER=""
-CLI_PASS=""
+CLI_USER=""; CLI_PASS=""
 for a in "$@"; do
   case "$a" in
     --install) ACTION="install" ;;
@@ -38,34 +37,25 @@ for a in "$@"; do
 done
 [ -z "${ACTION}" ] && ACTION="install"
 
-die(){ echo -e "\e[1;31m$*\e[0m" >&2; exit 1; }
 say(){ echo -e "$*"; }
 ok(){ say "\e[1;32m$*\e[0m"; }
 info(){ say "\e[1;36m$*\e[0m"; }
 
-# ===== Steps =====
 ask_credentials() {
-  if [ -n "${CLI_USER:-}" ] && [ -n "${CLI_PASS:-}" ]; then
+  if [ -n "${CLI_USER}" ] && [ -n "${CLI_PASS}" ]; then
     ADMIN_USER="$CLI_USER"; ADMIN_PASS="$CLI_PASS"
-    echo -e "\n\e[1;33m🔐 Admin Login (from flags)\e[0m"
-    echo "Admin Username: $ADMIN_USER"
+    say "\n\033[1;33m🔐 Admin Login (from flags)\033[0m"
+    say "Admin Username: $ADMIN_USER"
     return
   fi
-  echo -e "\n\e[1;33m🔐 Admin Login သတ်မှတ်ပါ:\e[0m"
+  say "\n\033[1;33m🔐 Admin Login သတ်မှတ်ပါ\033[0m"
   while :; do
     read -rp "Admin Username: " ADMIN_USER
     [ -n "${ADMIN_USER:-}" ] && break
-    echo "⚠️ Username လိုအပ်သည်"
   done
   while :; do
-    if [ -t 0 ]; then
-      read -rsp "Admin Password: " ADMIN_PASS || true; echo
-      [ -z "${ADMIN_PASS:-}" ] && read -rp "Admin Password (visible): " ADMIN_PASS || true
-    else
-      read -rp "Admin Password (visible): " ADMIN_PASS || true
-    fi
+    if [ -t 0 ]; then read -rsp "Admin Password: " ADMIN_PASS; echo; else read -rp "Admin Password (visible): " ADMIN_PASS; fi
     [ -n "${ADMIN_PASS:-}" ] && break
-    echo "⚠️ Password လိုအပ်သည်"
   done
 }
 
@@ -81,7 +71,7 @@ import os, sqlite3, uuid, datetime
 from flask import Flask, request, jsonify, g, session, redirect, url_for, render_template_string
 
 # ==== ENV ====
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET","changeme")  # header X-Admin-Secret
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET","changeme")     # header X-Admin-Secret
 DB_PATH      = os.environ.get("DB_PATH","/var/lib/upkapi/keys.db")
 BIND         = os.environ.get("BIND","0.0.0.0")
 PORT         = int(os.environ.get("PORT","8088"))
@@ -161,7 +151,7 @@ def consume():
     db.commit()
     return jsonify({"ok":True,"msg":"consumed"})
 
-# ==== UI (Login + Admin) ====
+# ==== UI ====
 LOGIN_HTML = """
 <!doctype html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -280,6 +270,7 @@ def login():
     if request.method=="POST":
         u = request.form.get("username","")
         p = request.form.get("password","")
+        # ✅ Strictly check BOTH username & password against ENV
         if u == LOGIN_USER and p == LOGIN_PASS:
             session["auth"] = True
             return redirect(url_for("admin"))
@@ -359,9 +350,7 @@ case "$ACTION" in
     if command -v ufw >/dev/null 2>&1; then ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true; fi
     start_service
     sleep 1
-    IFACE=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/dev/{print $5;exit}')
     IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    [ -z "$IP" ] && IP="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
     ok "✅ Installation complete!"
     echo "Root URL    : http://${IP:-<SERVER_IP>}:${PORT}/"
     echo "Admin Login : http://${IP:-<SERVER_IP>}:${PORT}/login"
@@ -384,6 +373,7 @@ case "$ACTION" in
     ok "Removed service. App dir kept at $APPDIR"
     ;;
   *)
-    die "Unknown action"
+    echo "Usage: --install [--secret=.. --port=.. --user=.. --pass=..] | --status | --logs | --restart | --uninstall"
+    exit 1
     ;;
 esac
