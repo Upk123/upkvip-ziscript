@@ -356,11 +356,9 @@ case "$ACTION" in
     write_app_py
     write_env
     write_unit
-    # UFW open (best-effort)
     if command -v ufw >/dev/null 2>&1; then ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true; fi
     start_service
     sleep 1
-    # Detect IP for hints
     IFACE=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/dev/{print $5;exit}')
     IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     [ -z "$IP" ] && IP="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
