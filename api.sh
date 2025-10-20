@@ -1,19 +1,20 @@
 #!/bin/bash
-# ZI One-Time Key API (Login + Modern UI Version)
-# Author: GPT DevLab
-# Install: sudo bash api.sh --install --secret="changeme" --port=8088
-# Manage:  --status | --logs | --restart | --uninstall
-
+# ZI One-Time Key API (with Login + Modern UI)
+# Install:  sudo bash api.sh --install --secret="changeme" --port=8088
+# Manage :  --status | --logs | --restart | --uninstall
 set -euo pipefail
 
-SECRET="changeme"
-PORT="8088"
-DB="/var/lib/upkapi/keys.db"
-BIND="0.0.0.0"
-APPDIR="/opt/zi-keyapi"
-ENVF="/etc/default/zi-keyapi"
+# -------- Defaults --------
+SECRET="changeme"                 # X-Admin-Secret (for /api/generate)
+PORT="8088"                       # Web/API port
+DB="/var/lib/upkapi/keys.db"      # SQLite DB path
+BIND="0.0.0.0"                    # Bind address
+APPDIR="/opt/zi-keyapi"           # App dir
+ENVF="/etc/default/zi-keyapi"     # Environment file
 UNIT="/etc/systemd/system/zi-keyapi.service"
+LOGO_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png"
 
+# -------- Parse args --------
 ACTION=""
 for a in "$@"; do
   case "$a" in
@@ -32,14 +33,21 @@ done
 [ -z "${ACTION}" ] && ACTION="install"
 
 die(){ echo -e "\e[1;31m$*\e[0m" >&2; exit 1; }
-ok(){ echo -e "\e[1;32m$*\e[0m"; }
-info(){ echo -e "\e[1;36m$*\e[0m"; }
+say(){ echo -e "$*"; }
+ok(){ say "\e[1;32m$*\e[0m"; }
+info(){ say "\e[1;36m$*\e[0m"; }
 
 ask_credentials() {
   echo -e "\n\e[1;33m🔐 Admin Login သတ်မှတ်ပါ:\e[0m"
   read -rp "Admin Username: " ADMIN_USER
-  read -rsp "Admin Password: " ADMIN_PASS
-  echo
+  read -rsp "Admin Password: " ADMIN_PASS; echo
+  [ -z "${ADMIN_USER:-}" ] && die "username ကိုထည့်ပါ"
+  [ -z "${ADMIN_PASS:-}" ] && die "password ကိုထည့်ပါ"
+}
+
+install_pkgs() {
+  apt-get update -y >/dev/null
+  apt-get install -y python3 python3-flask sqlite3 curl ca-certificates >/dev/null
 }
 
 write_app_py() {
@@ -48,17 +56,20 @@ write_app_py() {
 import os, sqlite3, uuid, datetime
 from flask import Flask, request, jsonify, g, session, redirect, url_for, render_template_string
 
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET","changeme")
-DB_PATH = os.environ.get("DB_PATH","/var/lib/upkapi/keys.db")
-BIND = os.environ.get("BIND","0.0.0.0")
-PORT = int(os.environ.get("PORT","8088"))
-LOGIN_USER = os.environ.get("ADMIN_USER","admin")
-LOGIN_PASS = os.environ.get("ADMIN_PASS","pass")
-APP_KEY = os.environ.get("APP_SECRET_KEY","supersecret")
+# ---- ENV ----
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET","changeme")  # header X-Admin-Secret
+DB_PATH      = os.environ.get("DB_PATH","/var/lib/upkapi/keys.db")
+BIND         = os.environ.get("BIND","0.0.0.0")
+PORT         = int(os.environ.get("PORT","8088"))
+LOGIN_USER   = os.environ.get("ADMIN_USER","admin")
+LOGIN_PASS   = os.environ.get("ADMIN_PASS","pass")
+APP_KEY      = os.environ.get("APP_SECRET_KEY","supersecret")
+LOGO_URL     = os.environ.get("LOGO_URL","")
 
 app = Flask(__name__)
 app.secret_key = APP_KEY
 
+# ---- DB ----
 def get_db():
     if "db" not in g:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -79,9 +90,9 @@ def close_db(exc):
     db = g.pop("db", None)
     if db is not None: db.close()
 
+# ---- API ----
 @app.get("/api/health")
-def health():
-    return jsonify({"ok": True})
+def health(): return jsonify({"ok": True})
 
 def is_admin(req): 
     return req.headers.get("X-Admin-Secret","") == ADMIN_SECRET
@@ -126,40 +137,27 @@ def consume():
     db.commit()
     return jsonify({"ok":True,"msg":"consumed"})
 
-# ---------- Login ----------
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        u = request.form.get("username")
-        p = request.form.get("password")
-        if u == LOGIN_USER and p == LOGIN_PASS:
-            session["auth"] = True
-            return redirect("/admin")
-        return render_template_string(LOGIN_HTML, error="Invalid credentials")
-    return render_template_string(LOGIN_HTML)
-
-@app.before_request
-def require_login():
-    if request.path.startswith("/admin") and session.get("auth") != True:
-        return redirect("/login")
-
+# ---- Login Guard ----
 LOGIN_HTML = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>🔐 Login</title>
 <style>
-body{margin:0;background:#0b1020;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh}
-.card{background:rgba(255,255,255,.08);padding:28px;border-radius:20px;max-width:360px;width:90%;box-shadow:0 10px 30px rgba(0,0,0,.4);text-align:center}
-.logo{width:100px;height:100px;border-radius:20px;margin-bottom:14px;object-fit:cover}
-h2{margin:0 0 18px;font-size:1.4rem}
-input{width:100%;padding:12px;margin:8px 0;border-radius:12px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#fff;font-size:1rem}
-button{width:100%;padding:12px;border-radius:12px;border:0;background:linear-gradient(180deg,#3b82f6,#1e40af);color:#fff;font-weight:bold;font-size:1rem;margin-top:10px}
-.err{color:#f87171;margin-bottom:10px}
+:root{--bg:#0b1020;--card:rgba(255,255,255,.08);--bd:rgba(255,255,255,.15);--fg:#fff;--brand:#3b82f6;--brand2:#1e40af}
+@media (prefers-color-scheme: light){:root{--bg:#f6f7fb;--card:#fff;--bd:#e5e7eb;--fg:#0f172a}}
+*{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{display:grid;place-items:center;min-height:100vh;font-family:system-ui,Segoe UI,Roboto,"Noto Sans Myanmar",sans-serif}
+.card{width:min(92vw,380px);background:var(--card);border:1px solid var(--bd);border-radius:20px;padding:22px;box-shadow:0 12px 40px rgba(0,0,0,.35);text-align:center}
+.logo{width:110px;height:110px;border-radius:22px;object-fit:cover;display:block;margin:6px auto 12px;box-shadow:0 8px 26px rgba(0,0,0,.35)}
+h2{margin:0 0 16px;font-size:1.35rem}
+input{width:100%;height:46px;border:1px solid var(--bd);border-radius:12px;padding:10px;margin:8px 0;background:transparent;color:inherit;font-size:1rem}
+button{width:100%;height:48px;border:0;border-radius:12px;background:linear-gradient(180deg,var(--brand),var(--brand2));color:#fff;font-weight:800;margin-top:6px}
+.err{color:#f87171;margin-bottom:8px}
+a{color:inherit;opacity:.8}
 </style></head>
 <body>
   <div class="card">
-    <img class="logo" src="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png">
+    <img class="logo" src="{{ logo }}">
     <h2>Admin Login</h2>
     {% if error %}<div class="err">{{error}}</div>{% endif %}
     <form method="post">
@@ -171,9 +169,109 @@ button{width:100%;padding:12px;border-radius:12px;border:0;background:linear-gra
 </body></html>
 """
 
+ADMIN_HTML = """
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>🔑 One-Time Key</title>
+<style>
+:root{--bg:#0b1020;--card:rgba(255,255,255,.06);--bd:rgba(255,255,255,.15);--fg:#e8eefc;--ring:rgba(91,140,255,.35);--brand:#5b8cff;--brand2:#3e64ff}
+@media (prefers-color-scheme: light){:root{--bg:#f7f8fb;--card:#fff;--bd:#e5e7eb;--fg:#0f172a;--ring:rgba(37,99,235,.25);--brand:#2563eb;--brand2:#1e40af}}
+*{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{min-height:100vh;display:grid;align-items:start;justify-items:center;font-family:system-ui,Segoe UI,Roboto,"Noto Sans Myanmar",sans-serif}
+.wrap{padding:14px;width:100%}
+.card{width:min(92vw,430px);background:var(--card);border:1px solid var(--bd);border-radius:22px;padding:18px 16px;box-shadow:0 20px 60px rgba(0,0,0,.25);backdrop-filter:blur(10px);margin:12px auto}
+.logo{display:block;margin:6px auto 10px;height:110px;width:110px;border-radius:24px;object-fit:cover;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+h1{text-align:center;font-size:1.35rem;margin:0 0 12px;font-weight:800}
+label{display:block;font-size:.95rem;margin:10px 6px 6px;opacity:.9}
+input{width:100%;height:48px;border:1px solid var(--bd);background:transparent;color:inherit;padding:12px;border-radius:14px;font-size:1rem;outline:none}
+input:focus{border-color:var(--brand);box-shadow:0 0 0 5px var(--ring)}
+.row{display:flex;gap:10px}.row>*{flex:1}
+.btn{width:100%;height:52px;margin-top:14px;border:0;border-radius:14px;background:linear-gradient(180deg,var(--brand),var(--brand2));color:#fff;font-weight:800;font-size:1.08rem}
+.result{margin-top:12px;border:1px dashed var(--bd);border-radius:14px;padding:8px}
+.resline{display:flex;gap:8px;align-items:center}
+.resline input{flex:1;height:46px}
+.copy{height:46px;padding:0 18px;border-radius:12px;border:1px solid var(--bd);background:rgba(255,255,255,.08);color:inherit;font-weight:700}
+.topnav{max-width:430px;margin:10px auto 0;text-align:right;padding:0 8px}
+.topnav a{color:inherit;opacity:.8;text-decoration:none}
+</style></head>
+<body>
+<div class="wrap">
+  <div class="topnav"><a href="/logout">Logout</a></div>
+  <div class="card">
+    <img class="logo" src="{{ logo }}">
+    <h1>🔑 Generate One-Time Key</h1>
+
+    <label>Admin Secret</label>
+    <input id="sec" type="password" placeholder="X-Admin-Secret" autocomplete="current-password">
+
+    <div class="row">
+      <div>
+        <label>Expires (hours)</label>
+        <input id="hrs" type="number" inputmode="numeric" min="0" step="1" placeholder="0 = no expire">
+      </div>
+      <div>
+        <label>Note</label>
+        <input id="note" type="text" placeholder="optional">
+      </div>
+    </div>
+
+    <div class="result">
+      <div class="resline">
+        <input id="keybox" type="text" placeholder="Ready." readonly>
+        <button class="copy" onclick="copyKey()">Copy</button>
+      </div>
+    </div>
+
+    <button class="btn" onclick="gen()">Generate</button>
+  </div>
+</div>
+
+<script>
+async function gen(){
+  const sec=document.getElementById('sec').value.trim();
+  const hrs=document.getElementById('hrs').value.trim();
+  const note=document.getElementById('note').value.trim();
+  const body={};
+  if(hrs!=="" && !isNaN(parseInt(hrs))) body.expires_in_hours=parseInt(hrs);
+  if(note!=="") body.note=note;
+
+  const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Secret':sec},body:JSON.stringify(body)});
+  const text=await r.text();
+  try{ const j=JSON.parse(text); document.getElementById('keybox').value=j.key||text; }
+  catch(e){ document.getElementById('keybox').value=text; }
+}
+async function copyKey(){
+  const v=document.getElementById('keybox').value; if(!v) return;
+  try{ await navigator.clipboard.writeText(v); }catch(e){}
+}
+</script>
+</body></html>
+"""
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method=="POST":
+        u = request.form.get("username","")
+        p = request.form.get("password","")
+        if u == LOGIN_USER and p == LOGIN_PASS:
+            session["auth"] = True
+            return redirect(url_for("admin"))
+        return render_template_string(LOGIN_HTML, error="Invalid credentials", logo=LOGO_URL)
+    return render_template_string(LOGIN_HTML, error=None, logo=LOGO_URL)
+
+@app.route("/logout")
+def logout():
+    session.pop("auth", None)
+    return redirect(url_for("login"))
+
+@app.before_request
+def guard():
+    if request.path.startswith("/admin") and session.get("auth") != True:
+        return redirect(url_for("login"))
+
 @app.get("/admin")
-def admin_page():
-    return "<h1 style='font-family:system-ui'>🔑 Logged in! Use the API to manage keys.</h1>"
+def admin():
+    return render_template_string(ADMIN_HTML, logo=LOGO_URL)
 
 if __name__ == "__main__":
     app.run(host=BIND, port=PORT)
@@ -203,6 +301,8 @@ EOF
 
 write_env() {
   mkdir -p "$(dirname "$ENVF")" "$(dirname "$DB")"
+  local APPKEY
+  APPKEY=$(uuidgen 2>/dev/null || echo "key-$(date +%s)")
   cat >"$ENVF" <<EOF
 ADMIN_SECRET=$SECRET
 PORT=$PORT
@@ -210,14 +310,10 @@ DB_PATH=$DB
 BIND=$BIND
 ADMIN_USER=$ADMIN_USER
 ADMIN_PASS=$ADMIN_PASS
-APP_SECRET_KEY=$(uuidgen)
+APP_SECRET_KEY=$APPKEY
+LOGO_URL=$LOGO_URL
 EOF
   chmod 600 "$ENVF"
-}
-
-install_pkgs() {
-  apt-get update -y >/dev/null
-  apt-get install -y python3 python3-flask sqlite3 curl ca-certificates >/dev/null
 }
 
 start_service() {
@@ -225,6 +321,7 @@ start_service() {
   systemctl enable --now zi-keyapi.service
 }
 
+# -------- Actions --------
 case "$ACTION" in
   install)
     ask_credentials
@@ -236,10 +333,12 @@ case "$ACTION" in
     start_service
     sleep 1
     ok "✅ Installation complete!"
-    echo "Admin Login: http://<SERVER_IP>:$PORT/login"
+    echo "Admin Login : http://<SERVER_IP>:$PORT/login"
+    echo "Admin Panel : http://<SERVER_IP>:$PORT/admin   (login first)"
+    echo "Health      : curl -s http://127.0.0.1:$PORT/api/health"
     ;;
   restart)
-    systemctl restart zi-keyapi.service
+    systemctl restart zi-keyapi.service && ok "restarted."
     ;;
   status)
     systemctl --no-pager -l status zi-keyapi.service
@@ -251,6 +350,9 @@ case "$ACTION" in
     systemctl disable --now zi-keyapi.service 2>/dev/null || true
     rm -f "$UNIT" "$ENVF"
     systemctl daemon-reload
-    ok "✅ Removed service. App dir kept at $APPDIR"
+    ok "Removed service. App dir kept at $APPDIR"
+    ;;
+  *)
+    die "Unknown action"
     ;;
 esac
