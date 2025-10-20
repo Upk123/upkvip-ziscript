@@ -1,150 +1,177 @@
 <!doctype html>
 <html lang="my">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ZI Admin — One-Time Key Console</title>
-<style>
-  :root{
-    --bg:#0b1020; --card:#11172b; --muted:#8aa0c8; --fg:#e7eefc; --bd:#263252;
-    --brand:#7aa2ff; --ok:#5ee17a; --bad:#ff6b6b; --warn:#ffd166;
-  }
-  *{box-sizing:border-box} body{margin:0; background:linear-gradient(180deg,#0b1020,#0b1020 40%,#0e1630);
-    color:var(--fg); font-family: ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; }
-  .wrap{max-width:980px;margin:28px auto;padding:0 16px}
-  header{display:flex;gap:14px;align-items:center;margin-bottom:18px}
-  .logo{width:52px;height:52px;border-radius:12px;background: #1a2340; display:flex;align-items:center;justify-content:center;
-        box-shadow: 0 6px 18px rgba(0,0,0,.35)}
-  .logo span{font-weight:800;color:#cfe2ff}
-  h1{margin:0;font-size:1.6rem;font-weight:800;letter-spacing:.2px}
-  .sub{color:var(--muted);font-size:.95rem;margin-top:2px}
-  .card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin:14px 0}
-  label{display:block;margin:8px 0 6px;color:#cfe2ff}
-  input,select,textarea{width:100%;padding:10px 12px;border:1px solid var(--bd);border-radius:10px;background:#0f1a32;color:var(--fg)}
-  .row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-  .btn{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--bd);background:#142247;color:var(--fg);
-       padding:10px 14px;border-radius:999px;cursor:pointer}
-  .btn.primary{background:var(--brand); color:#0b1020; border-color:transparent; font-weight:700}
-  .btn.warn{background:#1f2640;border-color:#3a4878}
-  .btn:hover{filter:brightness(1.05)}
-  .muted{color:var(--muted)}
-  .pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid var(--bd);background:#0e1833;color:#cfe2ff}
-  .ok{color:var(--ok)} .bad{color:var(--bad)} .warnc{color:var(--warn)}
-  code,kbd{background:#0f1a32;border:1px solid var(--bd);border-radius:8px;padding:2px 6px}
-  pre{white-space:pre-wrap;word-break:break-word;background:#0f1a32;border:1px solid var(--bd);border-radius:10px;padding:12px}
-  .grid-3{display:grid;grid-template-columns:1.1fr .9fr .9fr;gap:12px}
-  .keybox{font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:1.05rem}
-  .right{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
-  .hr{height:1px;background:var(--bd);margin:12px 0}
-</style>
+  <meta charset="utf-8">
+  <title>ZI Admin — One-Time Key Console (HTTP)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root{--bg:#0b1220;--card:#101728;--fg:#e6ebff;--muted:#8aa0c8;--bd:#1e2a44;
+          --ok:#2ecc71;--bad:#ff6b6b;--btn:#182443;--btnbd:#2b3b63}
+    html,body{background:#0b1220;color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Arial}
+    .wrap{max-width:920px;margin:28px auto;padding:0 14px}
+    .card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin:14px 0}
+    h1{margin:0 0 8px 0;font-size:1.6rem}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .row > div{flex:1 1 280px}
+    label{display:block;color:var(--muted);font-size:.9rem;margin:2px 0 6px}
+    input,select,textarea{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--bd);
+      background:#0c1426;color:var(--fg)}
+    button{padding:10px 14px;border-radius:999px;border:1px solid var(--btnbd);background:var(--btn);
+      color:var(--fg);cursor:pointer}
+    .actions{display:flex;gap:10px;flex-wrap:wrap}
+    .muted{color:var(--muted)}
+    .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid var(--bd)}
+    .ok{color:var(--ok);border-color:var(--ok)}
+    .bad{color:var(--bad);border-color:var(--bad)}
+    pre{white-space:pre-wrap;background:#0c1426;border:1px solid var(--bd);padding:12px;border-radius:10px}
+  </style>
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <div class="logo"><span>ZI</span></div>
-      <div style="flex:1">
-        <h1>ZI Admin — One-Time Key Console</h1>
-        <div class="sub">API URL + Admin Secret ထည့်ပြီး Connect → Create Key ပြုလုပ်ပါ</div>
+<div class="wrap">
+  <h1>ZI Admin — One-Time Key Console <span id="health" class="pill">health: …</span></h1>
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>API URL (HTTP)</label>
+        <input id="api" placeholder="http://43.229.135.219:8088">
       </div>
-      <div class="right">
-        <span id="healthBadge" class="pill"><span>Health:</span><b class="muted">unknown</b></span>
-      </div>
-    </header>
-
-    <div class="card">
-      <div class="row">
-        <div>
-          <label>API URL (HTTPS ဥပမာ: <code>https://api.yourdomain.com</code>)</label>
-          <input id="apiUrl" placeholder="https://api.yourdomain.com">
-        </div>
-        <div>
-          <label>Admin Secret</label>
-          <input id="adminSecret" type="password" placeholder="••••••••">
-        </div>
-      </div>
-      <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
-        <button class="btn" id="btnHealth">Check Health</button>
-        <button class="btn primary" id="btnConnect">Connect</button>
-        <button class="btn warn" id="btnSave">Save to Browser</button>
-        <span class="muted" id="connMsg"></span>
+      <div>
+        <label>Admin Secret</label>
+        <input id="secret" placeholder="newapi">
       </div>
     </div>
-
-    <div class="card">
-      <h3 style="margin:0 0 10px">Create One-Time Key</h3>
-      <div class="grid-3">
-        <div>
-          <label>Note (optional)</label>
-          <input id="note" placeholder="e.g. VPS-01 setup">
-        </div>
-        <div>
-          <label>Endpoint (Create)</label>
-          <select id="createPath">
-            <option value="/api/key">/api/key</option>
-            <option value="/api/keys/create">/api/keys/create</option>
-          </select>
-        </div>
-        <div>
-          <label>&nbsp;</label>
-          <button class="btn primary" id="btnCreate">Create Key</button>
-        </div>
-      </div>
-      <div class="hr"></div>
-      <label>Generated Key</label>
-      <input id="genKey" class="keybox" readonly placeholder="— no key yet —">
-      <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
-        <button class="btn" id="btnCopy">Copy Key</button>
-        <button class="btn" id="btnMakeCurl">Make cURL for User</button>
-        <span class="muted" id="keyMsg"></span>
-      </div>
-      <div id="curlWrap" style="display:none;margin-top:12px">
-        <label>User Command (example)</label>
-        <pre id="curlText"></pre>
-      </div>
+    <div class="actions" style="margin-top:10px">
+      <button onclick="save()">Save</button>
+      <button onclick="checkHealth()">Check Health</button>
+      <button onclick="connect()">Connect</button>
     </div>
-
-    <div class="card">
-      <h3 style="margin:0 0 10px">Validate Key (စမ်းသပ်용)</h3>
-      <div class="row">
-        <div>
-          <label>Key</label>
-          <input id="valKey" class="keybox" placeholder="paste key to test">
-        </div>
-        <div>
-          <label>Endpoint (Validate)</label>
-          <select id="validatePath">
-            <option value="/api/validate">/api/validate</option>
-          </select>
-        </div>
-      </div>
-      <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
-        <button class="btn" id="btnValidate">Validate</button>
-        <span id="valMsg" class="muted"></span>
-      </div>
-    </div>
-
-    <div class="muted" style="text-align:center;margin:22px 0 6px">
-      ZI Admin UI • Single-file HTML • Save API settings locally only (localStorage)
+    <div class="muted" style="margin-top:8px">
+      UI ကို HTTPS ထဲထည့်ရင် HTTP API ကို Browser က ပိတ်နိုင်တယ် – ဒီဖိုင်ကို HTTP ပေါ်ကနေဖွင့်ပါ။
     </div>
   </div>
 
+  <div class="card">
+    <h3 style="margin:0 0 10px">Create One-Time Key</h3>
+    <div class="row">
+      <div>
+        <label>Endpoint</label>
+        <input id="epCreate" value="/api/key">
+      </div>
+      <div>
+        <label>Note (optional, client-side only)</label>
+        <input id="note">
+      </div>
+    </div>
+    <div class="actions" style="margin-top:10px">
+      <button onclick="createKey()">Create Key</button>
+      <button onclick="copyGen()">Copy Key</button>
+      <button onclick="makeCurl()">Make cURL for User</button>
+    </div>
+    <label style="margin-top:10px">Generated Key</label>
+    <input id="gen" readonly placeholder="— no key yet —">
+    <label style="margin-top:10px">cURL (for user)</label>
+    <textarea id="curl" rows="3" readonly></textarea>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 10px">Validate Key</h3>
+    <div class="row">
+      <div>
+        <label>Key</label>
+        <input id="keyToTest" placeholder="paste key to test">
+      </div>
+      <div>
+        <label>Endpoint</label>
+        <input id="epValidate" value="/api/validate">
+      </div>
+    </div>
+    <div class="actions" style="margin-top:10px">
+      <button onclick="validateKey()">Validate</button>
+    </div>
+    <pre id="out" class="muted">result will appear here…</pre>
+  </div>
+</div>
+
 <script>
-  const $ = sel => document.querySelector(sel);
-  const apiInput = $('#apiUrl');
-  const secretInput = $('#adminSecret');
-  const connMsg = $('#connMsg');
-  const healthBadge = $('#healthBadge').querySelector('b');
+  const el = id => document.getElementById(id);
+  function base(){ return (el('api').value||'').replace(/\/+$/,''); }
+  function secret(){ return el('secret').value||''; }
+  function save(){
+    localStorage.setItem('zi_api', el('api').value);
+    localStorage.setItem('zi_secret', el('secret').value);
+    alert('Saved.');
+  }
+  function load(){
+    const api = localStorage.getItem('zi_api')||'';
+    const sec = localStorage.getItem('zi_secret')||'';
+    if(api) el('api').value = api;
+    if(sec) el('secret').value = sec;
+  }
+  async function checkHealth(){
+    setHealth('checking…');
+    try{
+      const r = await fetch(base() + '/healthz', {cache:'no-store'});
+      const ok = r.ok;
+      setHealth(ok ? 'online' : 'offline', ok);
+    }catch(e){
+      setHealth('offline', false);
+    }
+  }
+  function connect(){ // Just health + remember
+    save(); checkHealth();
+  }
+  function setHealth(text, ok){
+    const h = el('health');
+    h.textContent = 'health: ' + text;
+    h.className = 'pill ' + (ok===true ? 'ok':'bad');
+  }
 
-  // Restore saved settings
-  (function restore(){
-    const saved = JSON.parse(localStorage.getItem('ziadmin') || '{}');
-    if(saved.api) apiInput.value = saved.api;
-    if(saved.secret) secretInput.value = saved.secret;
-  })();
-
-  function saveLocal(){
-    localStorage.setItem('ziadmin', JSON.stringify({
-      api: apiInput.value.trim(),
+  async function createKey(){
+    try{
+      const r = await fetch(base() + (el('epCreate').value||'/api/key'), {
+        method:'POST',
+        headers: {'X-Admin-Secret': secret()},
+      });
+      const j = await r.json();
+      if(j && j.key){
+        el('gen').value = j.key;
+        el('out').textContent = JSON.stringify(j, null, 2);
+      }else{
+        el('out').textContent = 'Unexpected response: ' + JSON.stringify(j);
+      }
+    }catch(e){
+      el('out').textContent = 'Create error: ' + e;
+    }
+  }
+  function copyGen(){
+    const v = el('gen').value||'';
+    if(!v){ alert('no key yet'); return; }
+    navigator.clipboard.writeText(v); alert('Copied.');
+  }
+  function makeCurl(){
+    const k = el('gen').value||'YOUR_KEY_HERE';
+    const cmd = `curl -s -X POST "${base() + '/api/validate'}" -H "Content-Type: application/json" -d '{"key":"${k}"}'`;
+    el('curl').value = cmd;
+  }
+  async function validateKey(){
+    const k = el('keyToTest').value || el('gen').value || '';
+    if(!k){ alert('no key'); return; }
+    try{
+      const r = await fetch(base() + (el('epValidate').value||'/api/validate'), {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({key:k})
+      });
+      const j = await r.json();
+      el('out').textContent = JSON.stringify(j, null, 2);
+    }catch(e){
+      el('out').textContent = 'Validate error: ' + e;
+    }
+  }
+  load(); checkHealth();
+</script>
+</body>
+</html>      api: apiInput.value.trim(),
       secret: secretInput.value
     }));
     connMsg.textContent = 'Saved.';
