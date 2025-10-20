@@ -1,20 +1,22 @@
 #!/bin/bash
-# ZI One-Time Key API (Login + Modern UI, single-file installer)
-# Install:  sudo bash api.sh --install --secret="changeme" --port=8088 [--user=NAME --pass=PASS]
-# Manage :  --status | --logs | --restart | --uninstall
+# ZI One-Time Key API (Login + Modern UI) — single-file installer
+# Install:
+#   sudo bash api.sh --install --secret="changeme" --port=8088 [--user=NAME --pass=PASS]
+# Manage:
+#   sudo bash api.sh --status | --logs | --restart | --uninstall
 set -euo pipefail
 
-# -------- Defaults --------
-SECRET="changeme"                 # X-Admin-Secret (for /api/generate)
-PORT="8088"                       # Web/API port
-DB="/var/lib/upkapi/keys.db"      # SQLite DB path
-BIND="0.0.0.0"                    # Bind address
-APPDIR="/opt/zi-keyapi"           # App dir
-ENVF="/etc/default/zi-keyapi"     # Environment file
+# ===== Defaults =====
+SECRET="changeme"                  # X-Admin-Secret for /api/generate
+PORT="8088"                        # Web/API port
+DB="/var/lib/upkapi/keys.db"       # SQLite DB path
+BIND="0.0.0.0"                     # Bind address
+APPDIR="/opt/zi-keyapi"            # App dir
+ENVF="/etc/default/zi-keyapi"      # Environment file
 UNIT="/etc/systemd/system/zi-keyapi.service"
 LOGO_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png"
 
-# -------- Parse args --------
+# ===== Parse args =====
 ACTION=""
 CLI_USER=""
 CLI_PASS=""
@@ -41,22 +43,19 @@ say(){ echo -e "$*"; }
 ok(){ say "\e[1;32m$*\e[0m"; }
 info(){ say "\e[1;36m$*\e[0m"; }
 
-# -------- Steps --------
+# ===== Steps =====
 ask_credentials() {
-  # Flags precedence
   if [ -n "${CLI_USER:-}" ] && [ -n "${CLI_PASS:-}" ]; then
-    ADMIN_USER="$CLI_USER"
-    ADMIN_PASS="$CLI_PASS"
+    ADMIN_USER="$CLI_USER"; ADMIN_PASS="$CLI_PASS"
     echo -e "\n\e[1;33m🔐 Admin Login (from flags)\e[0m"
     echo "Admin Username: $ADMIN_USER"
     return
   fi
-
   echo -e "\n\e[1;33m🔐 Admin Login သတ်မှတ်ပါ:\e[0m"
   while :; do
     read -rp "Admin Username: " ADMIN_USER
     [ -n "${ADMIN_USER:-}" ] && break
-    echo "⚠️  Username လိုအပ်သည်"
+    echo "⚠️ Username လိုအပ်သည်"
   done
   while :; do
     if [ -t 0 ]; then
@@ -66,7 +65,7 @@ ask_credentials() {
       read -rp "Admin Password (visible): " ADMIN_PASS || true
     fi
     [ -n "${ADMIN_PASS:-}" ] && break
-    echo "⚠️  Password လိုအပ်သည်"
+    echo "⚠️ Password လိုအပ်သည်"
   done
 }
 
@@ -81,7 +80,7 @@ write_app_py() {
 import os, sqlite3, uuid, datetime
 from flask import Flask, request, jsonify, g, session, redirect, url_for, render_template_string
 
-# ---- ENV ----
+# ==== ENV ====
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET","changeme")  # header X-Admin-Secret
 DB_PATH      = os.environ.get("DB_PATH","/var/lib/upkapi/keys.db")
 BIND         = os.environ.get("BIND","0.0.0.0")
@@ -94,7 +93,7 @@ LOGO_URL     = os.environ.get("LOGO_URL","")
 app = Flask(__name__)
 app.secret_key = APP_KEY
 
-# ---- DB ----
+# ==== DB ====
 def get_db():
     if "db" not in g:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -115,7 +114,7 @@ def close_db(exc):
     db = g.pop("db", None)
     if db is not None: db.close()
 
-# ---- API ----
+# ==== API ====
 @app.get("/api/health")
 def health(): return jsonify({"ok": True})
 
@@ -162,7 +161,7 @@ def consume():
     db.commit()
     return jsonify({"ok":True,"msg":"consumed"})
 
-# ---- UI (Login & Admin) ----
+# ==== UI (Login + Admin) ====
 LOGIN_HTML = """
 <!doctype html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -348,7 +347,7 @@ start_service() {
   systemctl enable --now zi-keyapi.service
 }
 
-# -------- Actions --------
+# ===== Actions =====
 case "$ACTION" in
   install)
     ask_credentials
@@ -361,7 +360,7 @@ case "$ACTION" in
     if command -v ufw >/dev/null 2>&1; then ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true; fi
     start_service
     sleep 1
-    # Detect IP for URLs
+    # Detect IP for hints
     IFACE=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/dev/{print $5;exit}')
     IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     [ -z "$IP" ] && IP="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
@@ -370,217 +369,6 @@ case "$ACTION" in
     echo "Admin Login : http://${IP:-<SERVER_IP>}:${PORT}/login"
     echo "Admin Panel : http://${IP:-<SERVER_IP>}:${PORT}/admin   (login first)"
     echo "Health      : curl -s http://127.0.0.1:${PORT}/api/health"
-    ;;
-  restart)
-    systemctl restart zi-keyapi.service && ok "restarted."
-    ;;
-  status)
-    systemctl --no-pager -l status zi-keyapi.service
-    ;;
-  logs)
-    journalctl -u zi-keyapi.service -n 200 --no-pager
-    ;;
-  uninstall)
-    systemctl disable --now zi-keyapi.service 2>/dev/null || true
-    rm -f "$UNIT" "$ENVF"
-    systemctl daemon-reload
-    ok "Removed service. App dir kept at $APPDIR"
-    ;;
-  *)
-    die "Unknown action"
-    ;;
-esac@media (prefers-color-scheme: light){:root{--bg:#f6f7fb;--card:#fff;--bd:#e5e7eb;--fg:#0f172a}}
-*{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--fg)}
-body{display:grid;place-items:center;min-height:100vh;font-family:system-ui,Segoe UI,Roboto,"Noto Sans Myanmar",sans-serif}
-.card{width:min(92vw,380px);background:var(--card);border:1px solid var(--bd);border-radius:20px;padding:22px;box-shadow:0 12px 40px rgba(0,0,0,.35);text-align:center}
-.logo{width:110px;height:110px;border-radius:22px;object-fit:cover;display:block;margin:6px auto 12px;box-shadow:0 8px 26px rgba(0,0,0,.35)}
-h2{margin:0 0 16px;font-size:1.35rem}
-input{width:100%;height:46px;border:1px solid var(--bd);border-radius:12px;padding:10px;margin:8px 0;background:transparent;color:inherit;font-size:1rem}
-button{width:100%;height:48px;border:0;border-radius:12px;background:linear-gradient(180deg,var(--brand),var(--brand2));color:#fff;font-weight:800;margin-top:6px}
-.err{color:#f87171;margin-bottom:8px}
-a{color:inherit;opacity:.8}
-</style></head>
-<body>
-  <div class="card">
-    <img class="logo" src="{{ logo }}">
-    <h2>Admin Login</h2>
-    {% if error %}<div class="err">{{error}}</div>{% endif %}
-    <form method="post">
-      <input name="username" placeholder="Username" required>
-      <input name="password" type="password" placeholder="Password" required>
-      <button type="submit">Login</button>
-    </form>
-  </div>
-</body></html>
-"""
-
-ADMIN_HTML = """
-<!doctype html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>🔑 One-Time Key</title>
-<style>
-:root{--bg:#0b1020;--card:rgba(255,255,255,.06);--bd:rgba(255,255,255,.15);--fg:#e8eefc;--ring:rgba(91,140,255,.35);--brand:#5b8cff;--brand2:#3e64ff}
-@media (prefers-color-scheme: light){:root{--bg:#f7f8fb;--card:#fff;--bd:#e5e7eb;--fg:#0f172a;--ring:rgba(37,99,235,.25);--brand:#2563eb;--brand2:#1e40af}}
-*{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--fg)}
-body{min-height:100vh;display:grid;align-items:start;justify-items:center;font-family:system-ui,Segoe UI,Roboto,"Noto Sans Myanmar",sans-serif}
-.wrap{padding:14px;width:100%}
-.card{width:min(92vw,430px);background:var(--card);border:1px solid var(--bd);border-radius:22px;padding:18px 16px;box-shadow:0 20px 60px rgba(0,0,0,.25);backdrop-filter:blur(10px);margin:12px auto}
-.logo{display:block;margin:6px auto 10px;height:110px;width:110px;border-radius:24px;object-fit:cover;box-shadow:0 8px 30px rgba(0,0,0,.35)}
-h1{text-align:center;font-size:1.35rem;margin:0 0 12px;font-weight:800}
-label{display:block;font-size:.95rem;margin:10px 6px 6px;opacity:.9}
-input{width:100%;height:48px;border:1px solid var(--bd);background:transparent;color:inherit;padding:12px;border-radius:14px;font-size:1rem;outline:none}
-input:focus{border-color:var(--brand);box-shadow:0 0 0 5px var(--ring)}
-.row{display:flex;gap:10px}.row>*{flex:1}
-.btn{width:100%;height:52px;margin-top:14px;border:0;border-radius:14px;background:linear-gradient(180deg,var(--brand),var(--brand2));color:#fff;font-weight:800;font-size:1.08rem}
-.result{margin-top:12px;border:1px dashed var(--bd);border-radius:14px;padding:8px}
-.resline{display:flex;gap:8px;align-items:center}
-.resline input{flex:1;height:46px}
-.copy{height:46px;padding:0 18px;border-radius:12px;border:1px solid var(--bd);background:rgba(255,255,255,.08);color:inherit;font-weight:700}
-.topnav{max-width:430px;margin:10px auto 0;text-align:right;padding:0 8px}
-.topnav a{color:inherit;opacity:.8;text-decoration:none}
-</style></head>
-<body>
-<div class="wrap">
-  <div class="topnav"><a href="/logout">Logout</a></div>
-  <div class="card">
-    <img class="logo" src="{{ logo }}">
-    <h1>🔑 Generate One-Time Key</h1>
-
-    <label>Admin Secret</label>
-    <input id="sec" type="password" placeholder="X-Admin-Secret" autocomplete="current-password">
-
-    <div class="row">
-      <div>
-        <label>Expires (hours)</label>
-        <input id="hrs" type="number" inputmode="numeric" min="0" step="1" placeholder="0 = no expire">
-      </div>
-      <div>
-        <label>Note</label>
-        <input id="note" type="text" placeholder="optional">
-      </div>
-    </div>
-
-    <div class="result">
-      <div class="resline">
-        <input id="keybox" type="text" placeholder="Ready." readonly>
-        <button class="copy" onclick="copyKey()">Copy</button>
-      </div>
-    </div>
-
-    <button class="btn" onclick="gen()">Generate</button>
-  </div>
-</div>
-
-<script>
-async function gen(){
-  const sec=document.getElementById('sec').value.trim();
-  const hrs=document.getElementById('hrs').value.trim();
-  const note=document.getElementById('note').value.trim();
-  const body={};
-  if(hrs!=="" && !isNaN(parseInt(hrs))) body.expires_in_hours=parseInt(hrs);
-  if(note!=="") body.note=note;
-
-  const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Secret':sec},body:JSON.stringify(body)});
-  const text=await r.text();
-  try{ const j=JSON.parse(text); document.getElementById('keybox').value=j.key||text; }
-  catch(e){ document.getElementById('keybox').value=text; }
-}
-async function copyKey(){
-  const v=document.getElementById('keybox').value; if(!v) return;
-  try{ await navigator.clipboard.writeText(v); }catch(e){}
-}
-</script>
-</body></html>
-"""
-
-@app.route("/login", methods=["GET","POST"])
-def login():
-    if request.method=="POST":
-        u = request.form.get("username","")
-        p = request.form.get("password","")
-        if u == LOGIN_USER and p == LOGIN_PASS:
-            session["auth"] = True
-            return redirect(url_for("admin"))
-        return render_template_string(LOGIN_HTML, error="Invalid credentials", logo=LOGO_URL)
-    return render_template_string(LOGIN_HTML, error=None, logo=LOGO_URL)
-
-@app.route("/logout")
-def logout():
-    session.pop("auth", None)
-    return redirect(url_for("login"))
-
-@app.before_request
-def guard():
-    if request.path.startswith("/admin") and session.get("auth") != True:
-        return redirect(url_for("login"))
-
-@app.get("/admin")
-def admin():
-    return render_template_string(ADMIN_HTML, logo=LOGO_URL)
-
-if __name__ == "__main__":
-    app.run(host=BIND, port=PORT)
-PY
-  chmod 644 "$APPDIR/app.py"
-}
-
-write_unit() {
-  cat >"$UNIT" <<EOF
-[Unit]
-Description=ZI One-Time Key API
-After=network.target
-
-[Service]
-Type=simple
-User=root
-EnvironmentFile=-$ENVF
-WorkingDirectory=$APPDIR
-ExecStart=/usr/bin/python3 $APPDIR/app.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-write_env() {
-  mkdir -p "$(dirname "$ENVF")" "$(dirname "$DB")"
-  local APPKEY
-  APPKEY=$(uuidgen 2>/dev/null || echo "key-$(date +%s)")
-  cat >"$ENVF" <<EOF
-ADMIN_SECRET=$SECRET
-PORT=$PORT
-DB_PATH=$DB
-BIND=$BIND
-ADMIN_USER=$ADMIN_USER
-ADMIN_PASS=$ADMIN_PASS
-APP_SECRET_KEY=$APPKEY
-LOGO_URL=$LOGO_URL
-EOF
-  chmod 600 "$ENVF"
-}
-
-start_service() {
-  systemctl daemon-reload
-  systemctl enable --now zi-keyapi.service
-}
-
-# -------- Actions --------
-case "$ACTION" in
-  install)
-    ask_credentials
-    info "📦 Installing ZI One-Time Key API…"
-    install_pkgs
-    write_app_py
-    write_env
-    write_unit
-    start_service
-    sleep 1
-    ok "✅ Installation complete!"
-    echo "Admin Login : http://<SERVER_IP>:$PORT/login"
-    echo "Admin Panel : http://<SERVER_IP>:$PORT/admin   (login first)"
-    echo "Health      : curl -s http://127.0.0.1:$PORT/api/health"
     ;;
   restart)
     systemctl restart zi-keyapi.service && ok "restarted."
