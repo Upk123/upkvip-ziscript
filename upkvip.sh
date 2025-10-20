@@ -6,6 +6,7 @@
 #           per-user Online/Offline via conntrack, expires accepts "YYYY-MM-DD" OR days "30",
 #           Web UI: Header logo + title + Messenger button, Delete button per user, clean styling,
 #           Login UI (form-based session, logo included) with /etc/zivpn/web.env credentials.
+#           +++ Added: ONE-TIME KEY GATE (consume from external API before installing)
 
 set -euo pipefail
 
@@ -23,6 +24,59 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
+# =====================================================================
+#                   ONE-TIME KEY GATE (NEW)
+# =====================================================================
+# Default API URL (ပြောင်းချင်ရင် --api=URL သို့မဟုတ် env KEY_API_URL ထိုး)
+KEY_API_URL="${KEY_API_URL:-http://43.229.135.219:8088}"
+ONE_TIME_KEY=""      # --key=XXXX ဖုန်း UI မှ generate လုပ်ထားတဲ့ key
+SKIP_KEY=0           # --skip-key (dev only)
+
+# very light arg parser (မူရင်း args မထိပဲ ထပ်ပေါင်းထားသည်)
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) ONE_TIME_KEY="${arg#*=}" ;;
+    --api=*) KEY_API_URL="${arg#*=}" ;;
+    --skip-key) SKIP_KEY=1 ;;
+  esac
+done
+
+consume_one_time_key() {
+  local _key="$1"
+  local _url="${KEY_API_URL%/}/api/consume"
+  if ! command -v curl >/dev/null 2>&1; then
+    echo -e "${R}curl မရှိပါ — apt-get install -y curl နဲ့အရင်တင်ပါ${Z}"
+    exit 2
+  fi
+  echo -e "${Y}🔑 One-time key စစ်နေပါတယ်…${Z}"
+  local resp
+  resp=$(curl -fsS -X POST "$_url" \
+           -H 'Content-Type: application/json' \
+           -d "{\"key\":\"${_key}\"}" 2>&1) || {
+    echo -e "${R}Key server ချိတ်ဆက်မရ: ${Z}$resp"
+    exit 2
+  }
+  if echo "$resp" | grep -q '"ok":\s*true'; then
+    echo -e "${G}✅ Key အတည်ပြုပြီး (consumed) — ဆက်လုပ်မယ်${Z}"
+  else
+    echo -e "${R}❌ Key မမှန်/ပြီးသုံးပြီး: ${Z}$resp"
+    exit 1
+  fi
+}
+
+# ===== One-time key prompt & gate (install မတိုင်ခင် အရင်ပိတ်) =====
+if [ "$SKIP_KEY" -ne 1 ]; then
+  if [ -z "$ONE_TIME_KEY" ]; then
+    echo -ne "${C}Enter one-time key: ${Z}"
+    read -r ONE_TIME_KEY
+  fi
+  [ -z "$ONE_TIME_KEY" ] && { echo -e "${R}key မထည့်ထားပါ — ပိတ်သိမ်း${Z}"; exit 1; }
+  consume_one_time_key "$ONE_TIME_KEY"
+else
+  echo -e "${Y}⚠️ key gate ကို --skip-key နဲ့ကျော်ခဲ့သည် (dev only)${Z}"
+fi
+# =====================================================================
+
 # ===== apt guards =====
 wait_for_apt() {
   echo -e "${Y}⏳ apt ပိတ်မချင်း စောင့်နေပါတယ်...${Z}"
@@ -38,7 +92,6 @@ wait_for_apt() {
   systemctl stop --now apt-daily.service apt-daily.timer 2>/dev/null || true
   systemctl stop --now apt-daily-upgrade.service apt-daily-upgrade.timer 2>/dev/null || true
 }
-
 apt_guard_start(){
   wait_for_apt
   CNF_CONF="/etc/apt/apt.conf.d/50command-not-found"
