@@ -1,178 +1,373 @@
 #!/usr/bin/env bash
-# ZI One-Time Key API — Full Installer (UPK edition)
-# - Flask API: /healthz, /api/key (admin), /api/validate (user)
-# - One-time keys stored at /opt/zi-keyapi/keys.txt
-# - systemd service + env file
-# - UFW firewall open
-# - Optional HTTPS reverse proxy via Caddy (Let's Encrypt)
-# Usage:
-#   sudo bash install-keyapi.sh --secret="upkapi" --port=8088 [--domain=upkapi.yourdomain.com]
+# api.sh — One-Time Key API (Flask+Gunicorn+systemd)
+# All-in-one installer/manager with optional HTTPS (nginx) + UFW rules
+# Usage examples:
+#   sudo bash api.sh --install --secret="SuperSecret" --port=8088
+#   sudo bash api.sh --status
+#   sudo bash api.sh --logs
+#   sudo bash api.sh --generate=24
+#   sudo bash api.sh --enable-https --domain=keys.example.com  # needs DNS A record -> this VPS
+#   sudo bash api.sh --enable-ufw
+#   sudo bash api.sh --uninstall
 
 set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
 
-# -------- Parse args --------
-ADMIN_SECRET=""
+SERVICE_NAME="zi-keyapi"
+APP_DIR="/opt/keyapi"
+APP_FILE="${APP_DIR}/keyapi.py"
+VENV_DIR="${APP_DIR}/venv"
+UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+ENV_FILE="/etc/default/${SERVICE_NAME}"
+
+SECRET="changeme"
 PORT="8088"
+DB_PATH="/var/lib/keyapi/keys.db"
+DEFAULT_EXP_HOURS="24"
+BIND="0.0.0.0"     # change to 127.0.0.1 if putting behind nginx
 DOMAIN=""
+ACTION="install"
+GEN_HOURS=""
+ENABLE_HTTPS=0
+ENABLE_UFW=0
+
+# ---------- arg parse ----------
 for arg in "$@"; do
   case "$arg" in
-    --secret=*) ADMIN_SECRET="${arg#*=}";;
-    --port=*)   PORT="${arg#*=}";;
-    --domain=*) DOMAIN="${arg#*=}";;
-    *) echo "Unknown arg: $arg"; exit 2;;
+    --install) ACTION="install" ;;
+    --status) ACTION="status" ;;
+    --logs) ACTION="logs" ;;
+    --uninstall) ACTION="uninstall" ;;
+    --generate) ACTION="generate" ;;
+    --generate=*) ACTION="generate"; GEN_HOURS="${arg#*=}" ;;
+    --secret=*) SECRET="${arg#*=}" ;;
+    --port=*) PORT="${arg#*=}" ;;
+    --db-path=*) DB_PATH="${arg#*=}" ;;
+    --default-exp=*) DEFAULT_EXP_HOURS="${arg#*=}" ;;
+    --bind=*) BIND="${arg#*=}" ;;
+    --domain=*) DOMAIN="${arg#*=}" ;;
+    --enable-https) ENABLE_HTTPS=1 ;;
+    --enable-ufw) ENABLE_UFW=1 ;;
+    *) echo "Unknown option: $arg"; exit 2 ;;
   esac
 done
 
-if [[ -z "${ADMIN_SECRET}" ]]; then
-  read -rp "Enter ADMIN_SECRET (e.g. upkapi): " ADMIN_SECRET
-fi
-if ! [[ "${PORT}" =~ ^[0-9]{2,5}$ ]]; then
-  echo "Invalid --port value"; exit 2
-fi
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "Run as root: sudo bash api.sh ..." >&2; exit 1
+  fi
+}
 
-APP_DIR="/opt/zi-keyapi"
-APP_FILE="${APP_DIR}/app.py"
-KEYS_FILE="${APP_DIR}/keys.txt"
-ENV_FILE="/etc/default/zi-keyapi"
-SERVICE_FILE="/etc/systemd/system/zi-keyapi.service"
+apt_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y python3-venv python3-pip sqlite3 curl jq ca-certificates
+}
 
-echo "==> Installing Key API (port: ${PORT}, secret: set, domain: ${DOMAIN:-none})"
+write_env() {
+  mkdir -p "$(dirname "$ENV_FILE")" "$(dirname "$DB_PATH")"
+  cat > "$ENV_FILE" <<EOF
+# ${SERVICE_NAME} environment
+ADMIN_SECRET="${SECRET}"
+DB_PATH="${DB_PATH}"
+PORT="${PORT}"
+DEFAULT_EXP_HOURS="${DEFAULT_EXP_HOURS}"
+BIND="${BIND}"
+EOF
+  chmod 640 "$ENV_FILE"
+  touch "$DB_PATH" || true
+}
 
-# -------- Packages --------
-apt-get update -y -o APT::Update::Post-Invoke-Success::= -o APT::Update::Post-Invoke::= >/dev/null
-apt-get install -y python3 python3-flask ufw curl ca-certificates >/dev/null
+write_app() {
+  mkdir -p "$APP_DIR"
+  python3 -m venv "$VENV_DIR"
+  "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
+  "${VENV_DIR}/bin/pip" install flask gunicorn >/dev/null
 
-# -------- Layout --------
-mkdir -p "${APP_DIR}"
-touch "${KEYS_FILE}"
+  # Flask app (API + /admin)
+  cat > "$APP_FILE" <<'PYEOF'
+import os, sqlite3, uuid, datetime
+from flask import Flask, request, jsonify, g, abort
 
-# -------- app.py --------
-cat > "${APP_FILE}" <<'PY'
-from flask import Flask, request, jsonify
-import os, secrets, time, pathlib
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "changeme")
+DB_PATH = os.environ.get("DB_PATH", "/var/lib/keyapi/keys.db")
+DEFAULT_EXP_HOURS = int(os.environ.get("DEFAULT_EXP_HOURS", "24"))
 
 app = Flask(__name__)
 
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET","").strip()
-KEYS_FILE = os.environ.get("KEYS_FILE","/opt/zi-keyapi/keys.txt")
+def get_db():
+    if "db" not in g:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+        g.db.execute("""CREATE TABLE IF NOT EXISTS keys(
+            id TEXT PRIMARY KEY,
+            created_at TIMESTAMP NOT NULL,
+            expires_at TIMESTAMP,
+            used_at TIMESTAMP,
+            used_ip TEXT,
+            note TEXT
+        )""")
+        g.db.execute("""CREATE TABLE IF NOT EXISTS logs(
+            at TIMESTAMP NOT NULL,
+            action TEXT NOT NULL,
+            key_id TEXT,
+            ip TEXT
+        )""")
+        g.db.commit()
+    return g.db
 
-p = pathlib.Path(KEYS_FILE)
-p.parent.mkdir(parents=True, exist_ok=True)
-if not p.exists(): p.write_text("", encoding="utf-8")
+@app.teardown_appcontext
+def close_db(exc):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
 
-def read_keys():
-    return set(k.strip() for k in p.read_text(encoding="utf-8").splitlines() if k.strip())
+def is_admin(req):
+    return req.headers.get("X-Admin-Secret", "") == ADMIN_SECRET
 
-def add_key(k: str):
-    with p.open("a", encoding="utf-8") as f:
-        f.write(k + "\n")
+def log(action, key_id=None):
+    try:
+        get_db().execute("INSERT INTO logs VALUES(?,?,?,?)",
+            (datetime.datetime.utcnow(), action, key_id, request.remote_addr))
+        get_db().commit()
+    except Exception:
+        pass
 
-def consume_key(k: str) -> bool:
-    keys = list(read_keys())
-    if k not in keys: return False
-    keys.remove(k)
-    p.write_text("\n".join(keys) + ("\n" if keys else ""), encoding="utf-8")
-    return True
+@app.post("/api/generate")
+def generate_key():
+    if not is_admin(request):
+        log("unauth_gen_attempt")
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    hours = DEFAULT_EXP_HOURS
+    note = None
+    if request.is_json:
+        hours = request.json.get("expires_in_hours", DEFAULT_EXP_HOURS)
+        note = request.json.get("note")
+    key_id = uuid.uuid4().hex
+    now = datetime.datetime.utcnow()
+    exp = now + datetime.timedelta(hours=int(hours)) if hours else None
 
-@app.get("/healthz")
-def healthz():
-    return jsonify(status="ok", time=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    db = get_db()
+    db.execute("INSERT INTO keys(id,created_at,expires_at,used_at,used_ip,note) VALUES(?,?,?,?,?,?)",
+               (key_id, now, exp, None, None, note))
+    db.commit()
+    log("generate", key_id)
+    return jsonify({"ok": True, "key": key_id, "expires_at": exp.isoformat() if exp else None, "note": note})
 
-@app.post("/api/key")
-def create_key():
-    if not ADMIN_SECRET or request.headers.get("X-Admin-Secret","").strip() != ADMIN_SECRET:
-        return jsonify(ok=False, error="unauthorized"), 401
-    key = secrets.token_hex(16)
-    add_key(key)
-    return jsonify(ok=True, key=key)
+@app.post("/api/consume")
+def consume_key():
+    if not request.is_json or "key" not in request.json:
+        return jsonify({"ok": False, "error": "missing_key"}), 400
+    key_id = request.json["key"]
+    db = get_db()
+    cur = db.execute("SELECT id, expires_at, used_at FROM keys WHERE id = ?", (key_id,))
+    row = cur.fetchone()
+    if not row:
+        log("consume_invalid", key_id)
+        return jsonify({"ok": False, "error": "invalid"}), 400
+    _, expires_at, used_at = row
+    now = datetime.datetime.utcnow()
+    if used_at is not None:
+        log("consume_used", key_id)
+        return jsonify({"ok": False, "error": "already_used"}), 409
+    if expires_at is not None:
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.datetime.fromisoformat(expires_at)
+            except Exception:
+                pass
+        if now > expires_at:
+            log("consume_expired", key_id)
+            return jsonify({"ok": False, "error": "expired"}), 410
 
-@app.post("/api/validate")
-def validate():
-    data = request.get_json(silent=True) or {}
-    key = str(data.get("key","")).strip()
-    if not key:
-        return jsonify(ok=False, error="key-required"), 400
-    ok = consume_key(key)  # one-time use
-    if not ok:
-        return jsonify(ok=False, error="invalid-key"), 400
-    return jsonify(ok=True, msg="valid")
+    db.execute("UPDATE keys SET used_at=?, used_ip=? WHERE id=? AND used_at IS NULL",
+               (now, request.remote_addr, key_id))
+    if db.total_changes == 0:
+        log("consume_race", key_id)
+        return jsonify({"ok": False, "error": "race_conflict"}), 409
+    db.commit()
+    log("consume_ok", key_id)
+    return jsonify({"ok": True, "msg": "consumed"})
 
-if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", "8088"))
-    app.run(host="0.0.0.0", port=port)
-PY
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True})
 
-# -------- ENV for systemd --------
-cat > "${ENV_FILE}" <<EOF
-ADMIN_SECRET=${ADMIN_SECRET}
-PORT=${PORT}
-KEYS_FILE=${KEYS_FILE}
-EOF
-chmod 600 "${ENV_FILE}"
+@app.get("/admin")
+def admin_page():
+    return """
+<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>
+<title>One-Time Key Admin</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;max-width:780px;margin:40px auto;padding:0 16px}
+ input,button{font-size:16px;padding:8px;margin:6px 0} pre{background:#f6f8fa;padding:12px;border-radius:8px}
+ .row{display:flex;gap:8px;align-items:center}.row input{flex:1}
+</style>
+<h2>Generate One-Time Key</h2>
+<div class=row>
+  <input id=sec type=password placeholder="Admin Secret (X-Admin-Secret)">
+  <input id=hrs type=number min=0 step=1 placeholder="Expires in hours (0 = no expiry)">
+  <input id=note type=text placeholder="Note (optional)">
+  <button onclick="gen()">Generate</button>
+</div>
+<pre id=out>Ready.</pre>
+<script>
+async function gen(){
+  const sec=document.getElementById('sec').value;
+  const hrs=parseInt(document.getElementById('hrs').value||'');
+  const note=document.getElementById('note').value||null;
+  const body={};
+  if(!isNaN(hrs)) body.expires_in_hours=hrs;
+  if(note) body.note=note;
+  const res=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Secret':sec},body:JSON.stringify(body)});
+  document.getElementById('out').textContent=await res.text();
+}
+</script>
+"""
+PYEOF
 
-# -------- systemd Unit --------
-cat > "${SERVICE_FILE}" <<EOF
+  chmod 755 "$APP_DIR" || true
+  chmod 644 "$APP_FILE"
+}
+
+write_unit() {
+  cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=ZI One-Time Key API
-After=network-online.target
-Wants=network-online.target
+Description=One-Time Key API (Flask via Gunicorn)
+After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=${ENV_FILE}
+User=root
+EnvironmentFile=-${ENV_FILE}
 WorkingDirectory=${APP_DIR}
-ExecStart=/usr/bin/python3 ${APP_FILE}
-Restart=always
-RestartSec=2
+ExecStart=${VENV_DIR}/bin/gunicorn -w 2 --timeout 30 -b \${BIND:-127.0.0.1}:\${PORT:-8088} keyapi:app
+Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# -------- Firewall --------
-ufw allow ${PORT}/tcp >/dev/null 2>&1 || true
-ufw reload >/dev/null 2>&1 || true
-
-# -------- Start service --------
-systemctl daemon-reload
-systemctl enable --now zi-keyapi.service
-
-# -------- Optional HTTPS via Caddy --------
-if [[ -n "${DOMAIN}" ]]; then
-  echo "==> Enabling HTTPS reverse proxy on ${DOMAIN} via Caddy…"
-  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https >/dev/null 2>&1 || true
-  curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | tee /usr/share/keyrings/caddy-stable-archive-keyring.gpg >/dev/null >/dev/null
-  curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-  apt-get update -y >/dev/null
-  apt-get install -y caddy >/dev/null
-  cat > /etc/caddy/Caddyfile <<EOC
-${DOMAIN} {
-    encode zstd gzip
-    reverse_proxy 127.0.0.1:${PORT}
+  systemctl daemon-reload
 }
-EOC
-  systemctl enable --now caddy
-  systemctl reload caddy || systemctl restart caddy
-  ufw allow 80/tcp >/dev/null 2>&1 || true
-  ufw allow 443/tcp >/dev/null 2>&1 || true
-fi
 
-# -------- Summary --------
-IP=$(hostname -I | awk '{print $1}')
-echo
-echo "================= DONE ================="
-echo " Admin Secret : ${ADMIN_SECRET}"
-echo " API Base     : http://${IP}:${PORT}"
-echo " Health       : http://${IP}:${PORT}/healthz"
-echo " Create Key   : POST /api/key     (header: X-Admin-Secret: ${ADMIN_SECRET})"
-echo " Validate     : POST /api/validate (json: {\"key\":\"...\"})"
-if [[ -n "${DOMAIN}" ]]; then
-  echo " HTTPS URL    : https://${DOMAIN}"
-  echo " (UI မှာ API URL ကို https://${DOMAIN} နဲ့သွင်းပါ)"
-else
-  echo " (UI မှာ API URL ကို http://${IP}:${PORT} နဲ့သွင်းပါ)"
-fi
-echo " Keys file    : ${KEYS_FILE}"
-echo " Service      : systemctl status zi-keyapi"
+start_service() {
+  systemctl enable "${SERVICE_NAME}.service" >/dev/null
+  systemctl restart "${SERVICE_NAME}.service"
+  sleep 1
+}
+
+show_status() { systemctl --no-pager -l status "${SERVICE_NAME}.service" || true; }
+tail_logs() { journalctl -u "${SERVICE_NAME}.service" -f; }
+
+enable_https() {
+  if [[ -z "$DOMAIN" ]]; then
+    echo "Set --domain=YOUR_DOMAIN with public DNS -> this VPS." >&2; exit 2
+  fi
+  apt-get install -y nginx certbot python3-certbot-nginx
+  # bind app to localhost when proxying
+  sed -i 's/^BIND=.*/BIND="127.0.0.1"/' "$ENV_FILE" || true
+  systemctl restart "${SERVICE_NAME}.service"
+
+  local site="/etc/nginx/sites-available/${SERVICE_NAME}"
+  cat > "$site" <<NGX
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    location / {
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_pass http://127.0.0.1:${PORT};
+    }
+    # Simple rate limit for brute-force
+    limit_req_zone \$binary_remote_addr zone=one:10m rate=5r/s;
+    location /api/consume { limit_req zone=one; proxy_pass http://127.0.0.1:${PORT}/api/consume; }
+    location /api/generate { limit_req zone=one; proxy_pass http://127.0.0.1:${PORT}/api/generate; }
+}
+NGX
+  ln -sf "$site" /etc/nginx/sites-enabled/${SERVICE_NAME}
+  nginx -t
+  systemctl restart nginx
+  # Let's Encrypt
+  certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m admin@"$DOMAIN"
+  echo "HTTPS enabled at https://${DOMAIN}"
+}
+
+enable_ufw() {
+  apt-get install -y ufw
+  ufw allow OpenSSH
+  if [[ "$ENABLE_HTTPS" -eq 1 || -n "$DOMAIN" ]]; then
+    ufw allow 443/tcp
+    ufw allow 80/tcp
+    # deny app port from public if proxying
+    ufw deny "${PORT}"/tcp || true
+  else
+    # no https: open app port directly
+    ufw allow "${PORT}"/tcp
+  fi
+  ufw --force enable
+  ufw status verbose
+}
+
+uninstall_all() {
+  systemctl stop "${SERVICE_NAME}.service" || true
+  systemctl disable "${SERVICE_NAME}.service" || true
+  rm -f "$UNIT_FILE"; systemctl daemon-reload
+  rm -rf "$APP_DIR"
+  echo "Service and app removed. Kept: ${ENV_FILE} and ${DB_PATH}"
+}
+
+install_flow() {
+  if [[ "$SECRET" == "changeme" ]]; then
+    echo "WARNING: Using default --secret=changeme. Set a strong secret with --secret=..." >&2
+  fi
+  apt_install
+  write_env
+  write_app
+  write_unit
+  start_service
+
+  echo
+  echo "=== ${SERVICE_NAME} Installed/Updated ==="
+  echo "Admin Secret : $SECRET"
+  echo "Port         : $PORT (bind ${BIND})"
+  echo "DB           : $DB_PATH"
+  echo "Default Exp  : ${DEFAULT_EXP_HOURS}h"
+  echo "Admin UI     : http://SERVER_IP:${PORT}/admin"
+  echo
+  show_status
+
+  if [[ "$ENABLE_HTTPS" -eq 1 ]]; then enable_https; fi
+  if [[ "$ENABLE_UFW" -eq 1 ]]; then enable_ufw; fi
+
+  echo
+  echo "API quick test:"
+  echo "curl -s -X GET http://127.0.0.1:${PORT}/api/health"
+  echo "curl -s -X POST http://127.0.0.1:${PORT}/api/generate -H 'Content-Type: application/json' -H 'X-Admin-Secret: ${SECRET}'"
+}
+
+generate_via_local() {
+  if [[ ! -f "$ENV_FILE" ]]; then echo "Env not found: $ENV_FILE (install first)"; exit 1; fi
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  local body="{}"
+  if [[ -n "$GEN_HOURS" ]]; then body="{\"expires_in_hours\": ${GEN_HOURS}}"; fi
+  curl -sS -X POST "http://127.0.0.1:${PORT}/api/generate" \
+    -H "Content-Type: application/json" \
+    -H "X-Admin-Secret: ${ADMIN_SECRET}" \
+    -d "$body"
+  echo
+}
+
+main() {
+  require_root
+  case "$ACTION" in
+    install)   install_flow ;;
+    status)    show_status ;;
+    logs)      tail_logs ;;
+    generate)  generate_via_local ;;
+    uninstall) uninstall_all ;;
+    *) echo "Unknown action"; exit 2 ;;
+  esac
+}
+main "$@"
