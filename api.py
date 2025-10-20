@@ -1,200 +1,188 @@
 #!/bin/bash
-# ZI One-Time Key API — full auto install
-# Creates Flask API + JSON DB + CORS + systemd + UFW
+# ZI One-Time Key API – full auto installer
+# - Creates /opt/zi-keyapi with app.py + keys.txt
+# - Installs python/pip + Flask, Flask-CORS
+# - Sets ADMIN_SECRET (random if not provided)
+# - Opens port 8088/tcp and enables a systemd service
+# Usage (optional custom secret):
+#   sudo ADMIN_SECRET="MyStrongSecret123" bash zi-keyapi-install.sh
+
 set -euo pipefail
 
-# ------- Config (can override by CLI flags) -------
-PORT_DEFAULT=8088
-SECRET_DEFAULT="CHANGE_ME_TO_STRONG_SECRET"
-CORS_DEFAULT="*"
-
-usage() {
-  cat <<EOF
-Usage: sudo bash $0 [--port=8088] [--secret=STRONG_SECRET] [--cors=https://yourname.github.io]
-Defaults: port=${PORT_DEFAULT}, secret=${SECRET_DEFAULT}, cors=${CORS_DEFAULT}
-EOF
-}
-
-PORT="${PORT_DEFAULT}"
-ADMIN_SECRET="${SECRET_DEFAULT}"
-CORS_ORIGIN="${CORS_DEFAULT}"
-
-for arg in "$@"; do
-  case "$arg" in
-    --port=*) PORT="${arg#--port=}" ;;
-    --secret=*) ADMIN_SECRET="${arg#--secret=}" ;;
-    --cors=*) CORS_ORIGIN="${arg#--cors=}" ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Unknown arg: $arg"; usage; exit 1 ;;
-  esac
-done
+B="\e[1;34m"; G="\e[1;32m"; Y="\e[1;33m"; R="\e[1;31m"; Z="\e[0m"
+say(){ echo -e "$1"; }
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Run as root: sudo bash $0"; exit 1
+  echo -e "${R}Please run as root (sudo -i)${Z}"; exit 1
 fi
 
-echo "==> Installing deps..."
-apt-get update -y >/dev/null
-apt-get install -y python3 python3-pip ufw >/dev/null
-python3 -m pip install --break-system-packages flask >/dev/null
+APP_DIR="/opt/zi-keyapi"
+APP_FILE="${APP_DIR}/app.py"
+KEY_FILE="${APP_DIR}/keys.txt"
+ENV_FILE="/etc/zi-keyapi.env"
+SERVICE="/etc/systemd/system/zi-keyapi.service"
+PORT="${PORT:-8088}"
 
-echo "==> Creating app files..."
-mkdir -p /opt/zi-keyapi
-cat >/opt/zi-keyapi/app.py <<'PY'
-from flask import Flask, request, jsonify, make_response
-import os, hmac, json, time, secrets
-from datetime import datetime
+# ---- Fix apt "command-not-found" bug if present (Ubuntu 20.04) ----
+CNF_CONF="/etc/apt/apt.conf.d/50command-not-found"
+if [ -f "$CNF_CONF" ]; then
+  mv "$CNF_CONF" "${CNF_CONF}.disabled" || true
+fi
 
-APP = Flask(__name__)
+say "${Y}Installing Python & pip...${Z}"
+apt-get update -y >/dev/null || true
+apt-get install -y python3 python3-pip ufw ca-certificates >/dev/null
 
-DB_PATH = os.environ.get("DB_PATH", "/opt/zi-keyapi/keys.json")
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "CHANGE_ME_TO_STRONG_SECRET")
-CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "*")  # e.g. https://yourname.github.io
+# restore file if we moved it
+if [ -f "${CNF_CONF}.disabled" ]; then
+  mv "${CNF_CONF}.disabled" "$CNF_CONF" || true
+fi
 
-def load_db():
-    try:
-        with open(DB_PATH, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+say "${Y}Installing Python packages (Flask, CORS)...${Z}"
+pip3 install --quiet --upgrade pip
+pip3 install --quiet flask flask-cors
 
-def save_db(d):
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with open(DB_PATH, "w") as f:
-        json.dump(d, f)
+say "${Y}Creating app directory & files...${Z}"
+mkdir -p "$APP_DIR"
+touch "$KEY_FILE"
 
-def is_admin(req):
-    return hmac.compare_digest(req.headers.get("X-Admin-Secret",""), ADMIN_SECRET)
+# ---- Create app.py ----
+cat >"$APP_FILE" <<'PY'
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import os
+from datetime import datetime, timedelta
+from secrets import token_hex
+from pathlib import Path
 
-@APP.after_request
-def add_cors(resp):
-    # allow CORS for admin site
-    resp.headers["Access-Control-Allow-Origin"] = CORS_ORIGIN
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Secret"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Max-Age"] = "86400"
-    return resp
+APP_DIR = Path("/opt/zi-keyapi")
+KEY_FILE = APP_DIR / "keys.txt"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+KEY_FILE.touch(exist_ok=True)
 
-@APP.route("/api/keys/create", methods=["POST","OPTIONS"])
+app = Flask(__name__)
+CORS(app)
+
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "changeme")
+PORT = int(os.environ.get("PORT", "8088"))
+
+def load_keys():
+    if not KEY_FILE.exists(): return []
+    with KEY_FILE.open() as f:
+        return [line.strip() for line in f if line.strip()]
+
+def save_keys(keys):
+    with KEY_FILE.open("w") as f:
+        f.write("\n".join(keys) + ("\n" if keys else ""))
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"message":"ZI Key API is running", "status":"ok", "time": datetime.utcnow().isoformat()})
+
+@app.post("/api/key")
 def create_key():
-    if request.method == "OPTIONS":
-        return ("",204)
-    if not is_admin(request):
-        return jsonify({"ok":False,"err":"unauthorized"}), 401
-    data = request.get_json(silent=True) or {}
-    ttl_min = int(data.get("ttl_minutes", 60))
-    note = (data.get("note",""))[:200]
-    token = secrets.token_urlsafe(32)
-    now = int(time.time())
-    d = load_db()
-    d[token] = {"note": note, "exp": now + ttl_min*60, "used": False, "created_at": now}
-    save_db(d)
-    return jsonify({"ok":True, "token":token, "expires_in_min":ttl_min, "note":note})
+    if request.headers.get("X-Admin-Secret") != ADMIN_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-@APP.route("/api/keys/status", methods=["GET","OPTIONS"])
-def status():
-    if request.method == "OPTIONS":
-        return ("",204)
-    if not is_admin(request):
-        return jsonify({"ok":False,"err":"unauthorized"}), 401
-    d = load_db()
-    items = []
-    for t,info in d.items():
-        items.append({
-            "token": t,
-            "note": info.get("note",""),
-            "expires_at_utc": datetime.utcfromtimestamp(info.get("exp",0)).isoformat(),
-            "used_at_utc": datetime.utcfromtimestamp(info["used"]) .isoformat() if isinstance(info.get("used"), int) else (info.get("used") or None),
-            "used": bool(info.get("used") not in (False, None))
-        })
-    items.sort(key=lambda x: x["expires_at_utc"], reverse=True)
-    return jsonify({"ok":True, "items":items})
+    body = request.get_json(silent=True) or {}
+    ttl = int(body.get("ttl", 60))
+    note = str(body.get("note", ""))
 
-@APP.route("/api/keys/revoke", methods=["POST","OPTIONS"])
-def revoke():
-    if request.method == "OPTIONS":
-        return ("",204)
-    if not is_admin(request):
-        return jsonify({"ok":False,"err":"unauthorized"}), 401
-    tok = (request.get_json(silent=True) or {}).get("token","").strip()
-    d = load_db()
-    if tok not in d:
-        return jsonify({"ok":False,"err":"invalid"}), 404
-    d[tok]["used"] = int(time.time())
-    save_db(d)
-    return jsonify({"ok":True})
+    token = token_hex(16)
+    exp = (datetime.utcnow() + timedelta(minutes=ttl)).isoformat()
 
-@APP.route("/api/keys/consume", methods=["POST","OPTIONS"])
-def consume():
-    if request.method == "OPTIONS":
-        return ("",204)
-    data = request.get_json(silent=True) or {}
-    tok = (data.get("token") or "").strip()
-    if not tok:
-        return jsonify({"ok":False,"err":"token required"}), 400
-    d = load_db()
-    info = d.get(tok)
-    if not info:
-        return jsonify({"ok":False,"err":"invalid"}), 404
-    if info.get("used") not in (False, None):
-        return jsonify({"ok":False,"err":"used"}), 409
-    now = int(time.time())
-    if now > int(info.get("exp",0)):
-        return jsonify({"ok":False,"err":"expired"}), 410
-    # mark used
-    info["used"] = now
-    d[tok] = info
-    save_db(d)
-    return jsonify({"ok":True})
+    keys = load_keys()
+    keys.append(f"{token}|{exp}|{note}")
+    save_keys(keys)
 
-@APP.route("/healthz")
-def health():
-    return "ok", 200
+    return jsonify({"ok": True, "key": token, "expires": exp, "note": note})
+
+@app.post("/api/validate")
+def validate():
+    body = request.get_json(silent=True) or {}
+    key = str(body.get("key","")).strip()
+    if not key:
+        return jsonify({"ok": False, "error": "key required"}), 400
+
+    now = datetime.utcnow()
+    keys = load_keys()
+    found = None
+    remain = []
+    for line in keys:
+        parts = line.split("|",2)
+        tok = parts[0]
+        exp = parts[1] if len(parts) > 1 else ""
+        if tok == key:
+            found = (tok, exp)
+            continue
+        remain.append(line)
+
+    if not found:
+        return jsonify({"ok": False, "error": "invalid"}), 400
+
+    try:
+        if now > datetime.fromisoformat(found[1]):
+            save_keys(remain)  # consume expired too
+            return jsonify({"ok": False, "error": "expired"}), 400
+    except Exception:
+        pass
+
+    save_keys(remain)  # consume on success (one-time)
+    return jsonify({"ok": True, "msg": "valid"})
 
 if __name__ == "__main__":
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    if not os.path.exists(DB_PATH):
-        save_db({})
-    port = int(os.environ.get("PORT","8088"))
-    APP.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)
 PY
 
-echo "==> Creating systemd unit..."
-cat >/etc/systemd/system/zi-keyapi.service <<UNIT
+chmod 644 "$APP_FILE" "$KEY_FILE"
+
+# ---- Secret & env file ----
+if [ -z "${ADMIN_SECRET:-}" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    ADMIN_SECRET="$(openssl rand -hex 16)"
+  else
+    ADMIN_SECRET="$(python3 - <<'P'\nimport secrets;print(secrets.token_hex(16))\nP\n)"
+  fi
+  GEN_NOTE="(generated)"
+else
+  GEN_NOTE="(from env)"
+fi
+
+cat >"$ENV_FILE" <<EOF
+# Environment for zi-keyapi
+ADMIN_SECRET=${ADMIN_SECRET}
+PORT=${PORT}
+EOF
+chmod 600 "$ENV_FILE"
+
+# ---- systemd service ----
+cat >"$SERVICE" <<'EOF'
 [Unit]
-Description=ZI One-Time Key API (Flask)
+Description=ZI One-Time Key API
 After=network.target
 
 [Service]
-User=root
+Type=simple
+EnvironmentFile=/etc/zi-keyapi.env
 WorkingDirectory=/opt/zi-keyapi
-Environment=ADMIN_SECRET=${ADMIN_SECRET}
-Environment=PORT=${PORT}
-Environment=CORS_ORIGIN=${CORS_ORIGIN}
-Environment=DB_PATH=/opt/zi-keyapi/keys.json
 ExecStart=/usr/bin/python3 /opt/zi-keyapi/app.py
 Restart=always
-RestartSec=2
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+EOF
 
-echo "==> Opening firewall (ufw)..."
+# ---- Firewall & start ----
 ufw allow ${PORT}/tcp >/dev/null 2>&1 || true
 
-echo "==> Starting service..."
 systemctl daemon-reload
 systemctl enable --now zi-keyapi
 
 IP=$(hostname -I | awk '{print $1}')
-echo
-echo "================ READY ================"
-echo " KEY_API        : http://$IP:${PORT}"
-echo " ADMIN_SECRET   : ${ADMIN_SECRET}"
-echo " CORS_ORIGIN    : ${CORS_ORIGIN}"
-echo " Health         : curl http://$IP:${PORT}/healthz"
-echo " Create Key     : curl -X POST http://$IP:${PORT}/api/keys/create -H 'Content-Type: application/json' -H 'X-Admin-Secret: ${ADMIN_SECRET}' -d '{\"ttl_minutes\":60,\"note\":\"test\"}'"
-echo " Status         : curl http://$IP:${PORT}/api/keys/status -H 'X-Admin-Secret: ${ADMIN_SECRET}'"
-echo " Revoke         : curl -X POST http://$IP:${PORT}/api/keys/revoke -H 'Content-Type: application/json' -H 'X-Admin-Secret: ${ADMIN_SECRET}' -d '{\"token\":\"<TOKEN>\"}'"
-echo "======================================="
+say "${G}✅ Install complete${Z}"
+echo -e "${B}API URL   :${Z} http://${IP}:${PORT}"
+echo -e "${B}Health    :${Z} curl http://${IP}:${PORT}/healthz"
+echo -e "${B}Admin Key :${Z} ${ADMIN_SECRET} ${Y}${GEN_NOTE}${Z}"
+echo -e "${B}Service   :${Z} systemctl status zi-keyapi  |  journalctl -u zi-keyapi -f"
+echo -e "${B}Config    :${Z} ${ENV_FILE}  (edit & 'systemctl restart zi-keyapi')"
