@@ -1,593 +1,379 @@
 #!/bin/bash
-# ZI One-Time Key API (Login UI) — error-free installer
-# - Prompts for admin user/pass if not supplied
-# - Auto-detects VPS public IP for final link
-# - Installs Flask app + systemd service
-# - Uses safe heredocs and no fragile f-strings
-
+# ZI One-Time Key API (Login + Modern UI) — single-file installer
+# Install:
+#   sudo bash api.sh --install --secret="changeme" --port=8088 [--user=NAME --pass=PASS]
+# Manage:
+#   sudo bash api.sh --status | --logs | --restart | --uninstall
 set -euo pipefail
 
 # ===== Defaults =====
-SECRET="changeme"
-PORT="8088"
-DB="/var/lib/upkapi/keys.db"
-BIND="0.0.0.0"
-APPDIR="/opt/zi-keyapi"
-ENVF="/etc/default/zi-keyapi"
+SECRET="changeme"                       # X-Admin-Secret (for /api/generate)
+PORT="8088"                             # Web/API port
+DB="/var/lib/upkapi/keys.db"            # SQLite DB
+BIND="0.0.0.0"                          # Bind address
+APPDIR="/opt/zi-keyapi"                 # App dir
+ENVF="/etc/default/zi-keyapi"           # Environment file used by systemd
 UNIT="/etc/systemd/system/zi-keyapi.service"
-LOGO_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/main/20251018_231111.png"
-FORCE_IP=""
-CLI_USER=""
-CLI_PASS=""
-ACTION=""
-
-log(){ printf "\033[1;32m[+] \033[0m%s\n" "$*"; }
-warn(){ printf "\033[1;33m[!] \033[0m%s\n" "$*"; }
-die(){ printf "\033[1;31m[x] \033[0m%s\n" "$*"; exit 1; }
-need_root(){ [[ $(id -u) -eq 0 ]] || die "Run as root (sudo)."; }
+LOGO_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png"
 
 # ===== Parse args =====
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --install) ACTION="install";;
-    --status) ACTION="status";;
-    --logs) ACTION="logs";;
-    --restart) ACTION="restart";;
-    --uninstall) ACTION="uninstall";;
-    --secret=*) SECRET="${1#*=}";;
-    --port=*) PORT="${1#*=}";;
-    --user=*) CLI_USER="${1#*=}";;
-    --pass=*) CLI_PASS="${1#*=}";;
-    --logo=*) LOGO_URL="${1#*=}";;
-    --db=*) DB="${1#*=}";;
-    --bind=*) BIND="${1#*=}";;
-    --ip=*) FORCE_IP="${1#*=}";;
-    *) die "Unknown argument: $1";;
+ACTION=""
+CLI_USER=""; CLI_PASS=""
+for a in "$@"; do
+  case "$a" in
+    --install) ACTION="install" ;;
+    --uninstall) ACTION="uninstall" ;;
+    --restart) ACTION="restart" ;;
+    --status) ACTION="status" ;;
+    --logs) ACTION="logs" ;;
+    --secret=*) SECRET="${a#*=}" ;;
+    --port=*)   PORT="${a#*=}" ;;
+    --db=*)     DB="${a#*=}" ;;
+    --bind=*)   BIND="${a#*=}" ;;
+    --user=*)   CLI_USER="${a#*=}" ;;
+    --pass=*)   CLI_PASS="${a#*=}" ;;
+    *) ;;
   esac
-  shift
 done
+[ -z "${ACTION}" ] && ACTION="install"
 
-ensure_deps(){
-  log "Installing dependencies…"
+say(){ echo -e "$*"; }
+ok(){ say "\e[1;32m$*\e[0m"; }
+info(){ say "\e[1;36m$*\e[0m"; }
+
+ask_credentials() {
+  if [ -n "${CLI_USER}" ] && [ -n "${CLI_PASS}" ]; then
+    ADMIN_USER="$CLI_USER"; ADMIN_PASS="$CLI_PASS"
+    say "\n\033[1;33m🔐 Admin Login (from flags)\033[0m"
+    say "Admin Username: $ADMIN_USER"
+    return
+  fi
+  say "\n\033[1;33m🔐 Admin Login သတ်မှတ်ပါ\033[0m"
+  while :; do
+    read -rp "Admin Username: " ADMIN_USER
+    [ -n "${ADMIN_USER:-}" ] && break
+  done
+  while :; do
+    if [ -t 0 ]; then read -rsp "Admin Password: " ADMIN_PASS; echo; else read -rp "Admin Password (visible): " ADMIN_PASS; fi
+    [ -n "${ADMIN_PASS:-}" ] && break
+  done
+}
+
+install_pkgs() {
   apt-get update -y >/dev/null
-  apt-get install -y python3 python3-venv python3-pip curl jq >/dev/null
+  apt-get install -y python3 python3-flask sqlite3 curl ca-certificates >/dev/null
 }
 
-prompt_creds_if_needed(){
-  if [[ -z "$CLI_USER" ]]; then
-    if [[ -t 0 ]]; then
-      read -r -p "Choose admin username (default: admin): " tmpu || true
-      CLI_USER="${tmpu:-admin}"
-    else
-      CLI_USER="admin"
-    fi
-  fi
-  if [[ -z "$CLI_PASS" ]]; then
-    if [[ -t 0 ]]; then
-      read -r -s -p "Choose admin password (default: pass): " tmpp || true
-      echo
-      CLI_PASS="${tmpp:-pass}"
-    else
-      CLI_PASS="pass"
-    fi
-  fi
-}
+write_app_py() {
+  mkdir -p "$APPDIR" "$(dirname "$DB")"
+  cat >"$APPDIR/app.py" <<'PY'
+import os, sqlite3, uuid, datetime
+from flask import Flask, request, jsonify, g, session, redirect, url_for, render_template_string
 
-write_env(){
-  log "Writing env: $ENVF"
-  mkdir -p "$(dirname "$ENVF")" /var/lib/upkapi
-  local APP_SECRET
-  if [[ -f "$ENVF" ]] && grep -q '^APP_SECRET_KEY=' "$ENVF"; then
-    APP_SECRET=$(sed -n 's/^APP_SECRET_KEY=//p' "$ENVF")
-  else
-    APP_SECRET=$(python3 - <<'__PY__'
-import secrets; print(secrets.token_hex(32))
-__PY__
-)
-  fi
-  cat >"$ENVF" <<__EOF__
-# Managed by api.sh
-ADMIN_SECRET=${SECRET}
-PORT=${PORT}
-DB_PATH=${DB}
-BIND=${BIND}
-LOGO_URL=${LOGO_URL}
-APP_SECRET_KEY=${APP_SECRET}
-ADMIN_USER=${CLI_USER}
-ADMIN_PASS=${CLI_PASS}
-# Backward compatibility
-LOGIN_USER=${CLI_USER}
-LOGIN_PASS=${CLI_PASS}
-__EOF__
-  chmod 640 "$ENVF" || true
-}
-
-write_app(){
-  log "Writing app → $APPDIR"
-  install -d "$APPDIR"
-  cat >"$APPDIR/app.py" <<'__PY__'
-#!/usr/bin/env python3
-import os
-from flask import Flask, request, redirect, session
-
-PORT = int(os.environ.get("PORT", "8088"))
-BIND = os.environ.get("BIND", "0.0.0.0")
-LOGO_URL = os.environ.get("LOGO_URL", "")
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "changeme")
-
-LOGIN_USER = os.environ.get("ADMIN_USER") or os.environ.get("LOGIN_USER", "admin")
-LOGIN_PASS = os.environ.get("ADMIN_PASS") or os.environ.get("LOGIN_PASS", "pass")
+# ==== ENV ====
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET","changeme")     # header X-Admin-Secret
+DB_PATH      = os.environ.get("DB_PATH","/var/lib/upkapi/keys.db")
+BIND         = os.environ.get("BIND","0.0.0.0")
+PORT         = int(os.environ.get("PORT","8088"))
+LOGIN_USER   = os.environ.get("ADMIN_USER","admin")
+LOGIN_PASS   = os.environ.get("ADMIN_PASS","pass")
+APP_KEY      = os.environ.get("APP_SECRET_KEY","supersecret")
+LOGO_URL     = os.environ.get("LOGO_URL","")
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("APP_SECRET_KEY", "dev-secret-override-me")
+app.secret_key = APP_KEY
 
-HTML_HEAD = """<!doctype html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin Login</title>
+# ==== DB ====
+def get_db():
+    if "db" not in g:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+        g.db.execute("""CREATE TABLE IF NOT EXISTS keys(
+            id TEXT PRIMARY KEY,
+            created_at TIMESTAMP NOT NULL,
+            expires_at TIMESTAMP,
+            used_at TIMESTAMP,
+            used_ip TEXT,
+            note TEXT
+        )""")
+        g.db.commit()
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exc):
+    db = g.pop("db", None)
+    if db is not None: db.close()
+
+# ==== API (Flask 1.x/2.x compatible) ====
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True})
+
+def is_admin(req):
+    return req.headers.get("X-Admin-Secret","") == ADMIN_SECRET
+
+@app.route("/api/generate", methods=["POST"])
+def generate():
+    if not is_admin(request):
+        return jsonify({"ok":False, "error":"unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    hours = data.get("expires_in_hours", 24)
+    note  = data.get("note")
+    key_id = uuid.uuid4().hex
+    now = datetime.datetime.utcnow()
+    exp = now + datetime.timedelta(hours=int(hours)) if hours else None
+    db = get_db()
+    db.execute("INSERT INTO keys(id,created_at,expires_at,used_at,used_ip,note) VALUES(?,?,?,?,?,?)",
+               (key_id, now, exp, None, None, note))
+    db.commit()
+    return jsonify({"ok": True, "key": key_id, "expires_at": exp.isoformat() if exp else None, "note": note})
+
+@app.route("/api/consume", methods=["POST"])
+def consume():
+    data = request.get_json(silent=True) or {}
+    key_id = data.get("key")
+    if not key_id:
+        return jsonify({"ok":False, "error":"missing_key"}), 400
+    db=get_db()
+    row = db.execute("SELECT id, expires_at, used_at FROM keys WHERE id=?", (key_id,)).fetchone()
+    if not row:
+        return jsonify({"ok":False, "error":"invalid"}), 400
+    _, expires_at, used_at = row
+    now = datetime.datetime.utcnow()
+    if used_at is not None:
+        return jsonify({"ok":False, "error":"already_used"}), 409
+    if expires_at is not None:
+        if isinstance(expires_at, str):
+            expires_at = datetime.datetime.fromisoformat(expires_at)
+        if now > expires_at:
+            return jsonify({"ok":False, "error":"expired"}), 410
+    db.execute("UPDATE keys SET used_at=?, used_ip=? WHERE id=? AND used_at IS NULL",
+               (now, request.remote_addr, key_id))
+    db.commit()
+    return jsonify({"ok":True,"msg":"consumed"})
+
+# ==== UI ====
+LOGIN_HTML = """
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>🔐 Login</title>
 <style>
-:root{--bg:#0b1220;--card:#0f172a;--bd:#26324b;--fg:#e5edf7;--muted:#9fb4d1;--brand:#4f46e5;--brand2:#0ea5e9}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
-.card{width:min(92vw,380px);background:var(--card);border:1px solid var(--bd);border-radius:20px;padding:22px;box-shadow:0 12px 40px rgba(0,0,0,.35);text-align:center;margin:8vh auto}
+:root{--bg:#0b1020;--card:rgba(255,255,255,.08);--bd:rgba(255,255,255,.15);--fg:#fff;--brand:#3b82f6;--brand2:#1e40af}
+@media (prefers-color-scheme: light){:root{--bg:#f6f7fb;--card:#fff;--bd:#e5e7eb;--fg:#0f172a}}
+*{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{display:grid;place-items:center;min-height:100vh;font-family:system-ui,Segoe UI,Roboto,"Noto Sans Myanmar",sans-serif}
+.card{width:min(92vw,380px);background:var(--card);border:1px solid var(--bd);border-radius:20px;padding:22px;box-shadow:0 12px 40px rgba(0,0,0,.35);text-align:center}
 .logo{width:110px;height:110px;border-radius:22px;object-fit:cover;display:block;margin:6px auto 12px;box-shadow:0 8px 26px rgba(0,0,0,.35)}
 h2{margin:0 0 16px;font-size:1.35rem}
 input{width:100%;height:46px;border:1px solid var(--bd);border-radius:12px;padding:10px;margin:8px 0;background:transparent;color:inherit;font-size:1rem}
-button{width:100%;height:48px;border:0;border-radius:12px;background:linear-gradient(108deg,var(--brand),var(--brand2));color:#fff;font-weight:800;margin-top:6px}
-.err{color:#f87171;margin-bottom:8px}.footer{opacity:.6;font-size:.85rem;margin-top:14px}
-</style></head><body>
+button{width:100%;height:48px;border:0;border-radius:12px;background:linear-gradient(180deg,var(--brand),var(--brand2));color:#fff;font-weight:800;margin-top:6px}
+.err{color:#f87171;margin-bottom:8px}
+</style></head>
+<body>
+  <div class="card">
+    <img class="logo" src="{{ logo }}">
+    <h2>Admin Login</h2>
+    {% if error %}<div class="err">{{error}}</div>{% endif %}
+    <form method="post">
+      <input name="username" placeholder="Username" required>
+      <input name="password" type="password" placeholder="Password" required>
+      <button type="submit">Login</button>
+    </form>
+  </div>
+</body></html>
 """
-HTML_FOOT = """<div class="footer">© ZI Key API</div></body></html>"""
 
-def render_login(err=None):
-    parts = ['<div class="card">']
-    if LOGO_URL:
-        parts.append(f'<img class="logo" src="{LOGO_URL}" alt="logo">')
-    parts.append("<h2>Admin Login</h2>")
-    if err:
-        parts.append(f'<div class="err">{err}</div>')
-    parts.append('<form method="post">')
-    parts.append('<input name="username" placeholder="Username" required>')
-    parts.append('<input name="password" type="password" placeholder="Password" required>')
-    parts.append('<button type="submit">Login</button>')
-    parts.append('</form></div>')
-    return HTML_HEAD + "".join(parts) + HTML_FOOT
+ADMIN_HTML = """
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>🔑 One-Time Key</title>
+<style>
+:root{--bg:#0b1020;--card:rgba(255,255,255,.06);--bd:rgba(255,255,255,.15);--fg:#e8eefc;--ring:rgba(91,140,255,.35);--brand:#5b8cff;--brand2:#3e64ff}
+@media (prefers-color-scheme: light){:root{--bg:#f7f8fb;--card:#fff;--bd:#e5e7eb;--fg:#0f172a;--ring:rgba(37,99,235,.25);--brand:#2563eb;--brand2:#1e40af}}
+*{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{min-height:100vh;display:grid;align-items:start;justify-items:center;font-family:system-ui,Segoe UI,Roboto,"Noto Sans Myanmar",sans-serif}
+.wrap{padding:14px;width:100%}
+.card{width:min(92vw,430px);background:var(--card);border:1px solid var(--bd);border-radius:22px;padding:18px 16px;box-shadow:0 20px 60px rgba(0,0,0,.25);backdrop-filter:blur(10px);margin:12px auto}
+.logo{display:block;margin:6px auto 10px;height:110px;width:110px;border-radius:24px;object-fit:cover;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+h1{text-align:center;font-size:1.35rem;margin:0 0 12px;font-weight:800}
+label{display:block;font-size:.95rem;margin:10px 6px 6px;opacity:.9}
+input{width:100%;height:48px;border:1px solid var(--bd);background:transparent;color:inherit;padding:12px;border-radius:14px;font-size:1rem;outline:none}
+input:focus{border-color:var(--brand);box-shadow:0 0 0 5px var(--ring)}
+.row{display:flex;gap:10px}.row>*{flex:1}
+.btn{width:100%;height:52px;margin-top:14px;border:0;border-radius:14px;background:linear-gradient(180deg,var(--brand),var(--brand2));color:#fff;font-weight:800;font-size:1.08rem}
+.result{margin-top:12px;border:1px dashed var(--bd);border-radius:14px;padding:8px}
+.resline{display:flex;gap:8px;align-items:center}
+.resline input{flex:1;height:46px}
+.copy{height:46px;padding:0 18px;border-radius:12px;border:1px solid var(--bd);background:rgba(255,255,255,.08);color:inherit;font-weight:700}
+.topnav{max-width:430px;margin:10px auto 0;text-align:right;padding:0 8px}
+.topnav a{color:inherit;opacity:.8;text-decoration:none}
+</style></head>
+<body>
+<div class="wrap">
+  <div class="topnav"><a href="/logout">Logout</a></div>
+  <div class="card">
+    <img class="logo" src="{{ logo }}">
+    <h1>🔑 Generate One-Time Key</h1>
+
+    <label>Admin Secret</label>
+    <input id="sec" type="password" placeholder="X-Admin-Secret" autocomplete="current-password">
+
+    <div class="row">
+      <div>
+        <label>Expires (hours)</label>
+        <input id="hrs" type="number" inputmode="numeric" min="0" step="1" placeholder="0 = no expire">
+      </div>
+      <div>
+        <label>Note</label>
+        <input id="note" type="text" placeholder="optional">
+      </div>
+    </div>
+
+    <div class="result">
+      <div class="resline">
+        <input id="keybox" type="text" placeholder="Ready." readonly>
+        <button class="copy" onclick="copyKey()">Copy</button>
+      </div>
+    </div>
+
+    <button class="btn" onclick="gen()">Generate</button>
+  </div>
+</div>
+
+<script>
+async function gen(){
+  const sec=document.getElementById('sec').value.trim();
+  const hrs=document.getElementById('hrs').value.trim();
+  const note=document.getElementById('note').value.trim();
+  const body={};
+  if(hrs!=="" && !isNaN(parseInt(hrs))) body.expires_in_hours=parseInt(hrs);
+  if(note!=="") body.note=note;
+
+  const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Secret':sec},body:JSON.stringify(body)});
+  const text=await r.text();
+  try{ const j=JSON.parse(text); document.getElementById('keybox').value=j.key||text; }
+  catch(e){ document.getElementById('keybox').value=text; }
+}
+async function copyKey(){
+  const v=document.getElementById('keybox').value; if(!v) return;
+  try{ await navigator.clipboard.writeText(v); }catch(e){}
+}
+</script>
+</body></html>
+"""
+
+@app.route("/")
+def root():
+    return redirect(url_for("login"))
 
 @app.route("/login", methods=["GET","POST"])
 def login():
-    if request.method == "GET":
-        return render_login()
-    u = request.form.get("username","")
-    p = request.form.get("password","")
-    if u == LOGIN_USER and p == LOGIN_PASS:
-        session["auth"] = True
-        return redirect("/")
-    return render_login("Invalid credentials")
+    if request.method=="POST":
+        u = request.form.get("username","")
+        p = request.form.get("password","")
+        if u == LOGIN_USER and p == LOGIN_PASS:
+            session["auth"] = True
+            return redirect(url_for("admin"))
+        return render_template_string(LOGIN_HTML, error="Invalid credentials", logo=LOGO_URL)
+    return render_template_string(LOGIN_HTML, error=None, logo=LOGO_URL)
 
-@app.route("/logout")
+@app.route("/logout", methods=["GET"])
 def logout():
-    session.clear()
-    return redirect("/login")
+    session.pop("auth", None)
+    return redirect(url_for("login"))
 
-def authed():
-    return session.get("auth") is True
+@app.before_request
+def guard():
+    if request.path.startswith("/admin") and session.get("auth") != True:
+        return redirect(url_for("login"))
 
-@app.route("/")
-def home():
-    if not authed():
-        return redirect("/login")
-    logo = f'<img class="logo" src="{LOGO_URL}" alt="logo">' if LOGO_URL else ""
-    body = f"""
-    <div class="card">
-      {logo}
-      <h2>Dashboard</h2>
-      <p>Welcome, <b>{LOGIN_USER}</b> ✅</p>
-      <p><a href="/logout">Logout</a></p>
-    </div>
-    """
-    return HTML_HEAD + body + HTML_FOOT
-
-@app.route("/api/health")
-def health():
-    return {"ok": True}
-
-@app.route("/api/generate", methods=["POST"])
-def generate():
-    if request.headers.get("X-Admin-Secret") != ADMIN_SECRET:
-        return {"error": "forbidden"}, 403
-    return {"status": "ok", "note": "stub"}
-
-if __name__ == "__main__":
-    app.run(host=BIND, port=PORT)
-__PY__
-  chmod +x "$APPDIR/app.py"
-
-  if [[ ! -d "$APPDIR/venv" ]]; then
-    log "Creating venv…"
-    python3 -m venv "$APPDIR/venv"
-  fi
-  log "Installing Flask…"
-  "$APPDIR/venv/bin/pip" install --upgrade pip >/dev/null
-  "$APPDIR/venv/bin/pip" install flask >/dev/null
-}
-
-write_unit(){
-  log "Writing unit → $UNIT"
-  cat >"$UNIT" <<'__UNIT__'
-[Unit]
-Description=ZI One-Time Key API (Login UI)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-EnvironmentFile=/etc/default/zi-keyapi
-WorkingDirectory=/opt/zi-keyapi
-ExecStart=/opt/zi-keyapi/venv/bin/python /opt/zi-keyapi/app.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-__UNIT__
-  systemctl daemon-reload
-}
-
-detect_ip(){
-  [[ -n "$FORCE_IP" ]] && { echo "$FORCE_IP"; return; }
-  for svc in "https://api.ipify.org" "https://ifconfig.co/ip" "https://checkip.amazonaws.com"; do
-    ip="$(curl -fsS --max-time 5 "$svc" || true)"
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
-  done
-  echo "127.0.0.1"
-}
-
-do_install(){
-  need_root
-  ensure_deps
-  prompt_creds_if_needed
-  write_env
-  write_app
-  write_unit
-  log "Enable & start service…"
-  systemctl enable zi-keyapi.service >/dev/null
-  systemctl restart zi-keyapi.service || true
-  sleep 1
-  systemctl --no-pager --full status zi-keyapi.service | sed -n '1,12p' || true
-
-  log "Health check:"
-  curl -fsS "http://127.0.0.1:${PORT}/api/health" || echo '{"ok": false}'
-
-  MYIP="$(detect_ip)"
-  echo
-  log "Done. Open: http://${MYIP}:${PORT}/login"
-  log "Env:  $ENVF"
-  log "App:  $APPDIR"
-}
-
-do_status(){ systemctl --no-pager --full status zi-keyapi.service; }
-do_logs(){ journalctl -u zi-keyapi.service -n 200 --no-pager; }
-do_restart(){ systemctl restart zi-keyapi.service && log "Restarted."; }
-do_uninstall(){
-  need_root
-  systemctl stop zi-keyapi.service || true
-  systemctl disable zi-keyapi.service || true
-  rm -f "$UNIT"
-  systemctl daemon-reload
-  warn "Removed service. Leave dirs/files in place:"
-  echo " - $APPDIR"
-  echo " - $ENVF"
-}
-
-case "${ACTION:-}" in
-  install) do_install;;
-  status) do_status;;
-  logs) do_logs;;
-  restart) do_restart;;
-  uninstall) do_uninstall;;
-  *) cat <<'__HELP__'
-Usage:
-  sudo bash api.sh --install [--port=8088] [--secret=changeme] [--logo=URL] [--ip=1.2.3.4]
-  sudo bash api.sh --install --user=upk123 --pass=123123
-  sudo bash api.sh --status | --logs | --restart | --uninstall
-__HELP__
-  ;;
-esac
-def render_login(err=None):
-    body = ['<div class="card">']
-    if LOGO_URL:
-        body.append(f'<img class="logo" src="{LOGO_URL}" alt="logo">')
-    body.append("<h2>Admin Login</h2>")
-    if err:
-        body.append(f'<div class="err">{err}</div>')
-    body.append('<form method="post">')
-    body.append('<input name="username" placeholder="Username" required>')
-    body.append('<input name="password" type="password" placeholder="Password" required>')
-    body.append('<button type="submit">Login</button>')
-    body.append('</form></div>')
-    return HTML_HEAD + "".join(body) + HTML_FOOT
-
-@app.route("/login", methods=["GET","POST"])
-def login():
-    if request.method == "GET":
-        return render_login()
-    u = request.form.get("username","")
-    p = request.form.get("password","")
-    if u == LOGIN_USER and p == LOGIN_PASS:
-        session["auth"] = True
-        return redirect("/")
-    return render_login("Invalid credentials")
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/login")
-
-def require_auth():
-    return session.get("auth") is True
-
-@app.route("/")
-def home():
-    if not require_auth():
-        return redirect("/login")
-    logo_html = f'<img class="logo" src="{LOGO_URL}" alt="logo">' if LOGO_URL else ""
-    html = HTML_HEAD + f"""
-    <div class="card">
-      {logo_html}
-      <h2>Dashboard</h2>
-      <p>Welcome, <b>{LOGIN_USER}</b> ✅</p>
-      <p><a href="/logout">Logout</a></p>
-    </div>
-    """ + HTML_FOOT
-    return html
-
-@app.route("/api/health")
-def health():
-    return {"ok": True}
-
-@app.route("/api/generate", methods=["POST"])
-def generate():
-    if request.headers.get("X-Admin-Secret") != ADMIN_SECRET:
-        return {"error":"forbidden"}, 403
-    return {"status":"ok","note":"stub"}
+@app.route("/admin", methods=["GET"])
+def admin():
+    return render_template_string(ADMIN_HTML, logo=LOGO_URL)
 
 if __name__ == "__main__":
     app.run(host=BIND, port=PORT)
 PY
-
-  chmod +x "$APPDIR/app.py"
-
-  # venv + deps
-  if [[ ! -d "$APPDIR/venv" ]]; then
-    log "Creating virtualenv..."
-    python3 -m venv "$APPDIR/venv"
-  fi
-  log "Installing Flask in venv..."
-  "$APPDIR/venv/bin/pip" install --upgrade pip >/dev/null
-  "$APPDIR/venv/bin/pip" install flask >/dev/null
+  chmod 644 "$APPDIR/app.py"
 }
 
-write_unit(){
-  log "Writing systemd unit: $UNIT"
-  cat > "$UNIT" <<EOF
+write_unit() {
+  cat >"$UNIT" <<EOF
 [Unit]
-Description=ZI One-Time Key API (Login UI)
+Description=ZI One-Time Key API
 After=network.target
 
 [Service]
 Type=simple
 User=root
-EnvironmentFile=$ENVF
+EnvironmentFile=-$ENVF
 WorkingDirectory=$APPDIR
-ExecStart=$APPDIR/venv/bin/python $APPDIR/app.py
+ExecStart=/usr/bin/python3 $APPDIR/app.py
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
 }
 
-detect_ip(){
-  if [[ -n "$FORCE_IP" ]]; then
-    echo "$FORCE_IP"
-    return
-  fi
-  # try multiple sources
-  for svc in "https://api.ipify.org" "https://ifconfig.co/ip" "https://checkip.amazonaws.com"; do
-    ip=$(curl -s --max-time 5 "$svc" || true)
-    if [[ -n "$ip" ]]; then
-      echo "$ip"
-      return
-    fi
-  done
-  echo "127.0.0.1"
-}
-
-do_install(){
-  need_root
-  ensure_deps
-  prompt_creds_if_needed
-  write_env
-  write_app
-  write_unit
-  log "Enabling & starting service..."
-  systemctl enable zi-keyapi.service
-  systemctl restart zi-keyapi.service || true
-  sleep 1
-  systemctl --no-pager --full status zi-keyapi.service || true
-
-  log "Health check:"
-  set +e
-  curl -sS "http://127.0.0.1:${PORT}/api/health" || true
-  set -e
-
-  IPV="$(detect_ip)"
-  log "Done. Open: http://${IPV}:${PORT}/login"
-  echo
-  log "Saved env: $ENVF"
-  log "App dir: $APPDIR"
-}
-
-do_status(){ systemctl --no-pager --full status zi-keyapi.service; }
-do_logs(){ journalctl -u zi-keyapi.service -n 200 --no-pager; }
-do_restart(){ systemctl restart zi-keyapi.service && log "Restarted."; }
-do_uninstall(){
-  need_root
-  systemctl stop zi-keyapi.service || true
-  systemctl disable zi-keyapi.service || true
-  rm -f "$UNIT"
-  systemctl daemon-reload
-  warn "Service removed. App dir & env left in place:"
-  echo " - $APPDIR"
-  echo " - $ENVF"
-  echo "Remove them manually if you want."
-}
-
-case "${ACTION:-}" in
-  install) do_install;;
-  status) do_status;;
-  logs) do_logs;;
-  restart) do_restart;;
-  uninstall) do_uninstall;;
-  *) cat <<USAGE
-Usage:
-  sudo bash api.sh --install [--port=8088 --secret=changeme --logo=URL --ip=1.2.3.4]
-  sudo bash api.sh --install --user=upk --pass=123   # skip interactive prompts
-  sudo bash api.sh --status | --logs | --restart | --uninstall
-USAGE
-;;
-esac    body.append('<input name="username" placeholder="Username" required>')
-    body.append('<input name="password" type="password" placeholder="Password" required>')
-    body.append('<button type="submit">Login</button>')
-    body.append('</form></div>')
-    return HTML_HEAD + "".join(body) + HTML_FOOT
-
-@app.route("/login", methods=["GET","POST"])
-def login():
-    if request.method == "GET":
-        return render_login()
-    u = request.form.get("username","")
-    p = request.form.get("password","")
-    if u == LOGIN_USER and p == LOGIN_PASS:
-        session["auth"] = True
-        return redirect("/")
-    return render_login("Invalid credentials")
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/login")
-
-def require_auth():
-    return session.get("auth") is True
-
-@app.route("/")
-def home():
-    if not require_auth():
-        return redirect("/login")
-    html = HTML_HEAD + f"""
-    <div class="card">
-      {'<img class="logo" src=\"'+LOGO_URL+'\" alt=\"logo\">' if LOGO_URL else ''}
-      <h2>Dashboard</h2>
-      <p>Welcome, <b>{LOGIN_USER}</b> ✅</p>
-      <p><a href="/logout">Logout</a></p>
-    </div>
-    """ + HTML_FOOT
-    return html
-
-@app.route("/api/health")
-def health():
-    return {"ok": True}
-
-# Example protected API (needs ADMIN_SECRET in header)
-@app.route("/api/generate", methods=["POST"])
-def generate():
-    if request.headers.get("X-Admin-Secret") != ADMIN_SECRET:
-        return {"error":"forbidden"}, 403
-    # TODO: generate key into DB if you add that later
-    return {"status":"ok","note":"stub"}
-
-if __name__ == "__main__":
-    app.run(host=BIND, port=PORT)
-PY
-  chmod +x "$APPDIR/app.py"
-
-  # Python venv + deps
-  if [[ ! -d "$APPDIR/venv" ]]; then
-    log "Creating virtualenv..."
-    python3 -m venv "$APPDIR/venv"
-  fi
-  log "Installing Flask..."
-  "$APPDIR/venv/bin/pip" install --upgrade pip >/dev/null
-  "$APPDIR/venv/bin/pip" install flask >/dev/null
-}
-
-write_unit(){
-  log "Writing systemd unit: $UNIT"
-  cat > "$UNIT" <<EOF
-[Unit]
-Description=ZI One-Time Key API (Login UI)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-EnvironmentFile=$ENVF
-WorkingDirectory=$APPDIR
-ExecStart=$APPDIR/venv/bin/python $APPDIR/app.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
+write_env() {
+  mkdir -p "$(dirname "$ENVF")" "$(dirname "$DB")"
+  APPKEY=$(uuidgen 2>/dev/null || echo "key-$(date +%s)")
+  cat >"$ENVF" <<EOF
+ADMIN_SECRET=$SECRET
+PORT=$PORT
+DB_PATH=$DB
+BIND=$BIND
+ADMIN_USER=$ADMIN_USER
+ADMIN_PASS=$ADMIN_PASS
+APP_SECRET_KEY=$APPKEY
+LOGO_URL=$LOGO_URL
 EOF
+  chmod 600 "$ENVF"
+}
+
+start_service() {
   systemctl daemon-reload
+  systemctl enable --now zi-keyapi.service
 }
 
-do_install(){
-  need_root
-  ensure_deps
-  write_env
-  write_app
-  write_unit
-  log "Enabling & starting service..."
-  systemctl enable zi-keyapi.service
-  systemctl restart zi-keyapi.service
-  sleep 1
-  systemctl --no-pager --full status zi-keyapi.service || true
-  log "Health check:"
-  set +e
-  curl -sS "http://127.0.0.1:${PORT}/api/health" || true
-  echo
-  set -e
-  log "Done. Open: http://<YOUR_SERVER_IP>:${PORT}/login"
-}
-
-do_status(){ systemctl --no-pager --full status zi-keyapi.service; }
-do_logs(){ journalctl -u zi-keyapi.service -n 200 --no-pager; }
-do_restart(){ systemctl restart zi-keyapi.service && log "Restarted."; }
-do_uninstall(){
-  need_root
-  systemctl stop zi-keyapi.service || true
-  systemctl disable zi-keyapi.service || true
-  rm -f "$UNIT"
-  systemctl daemon-reload
-  warn "Service removed. App dir & env left in place:"
-  echo " - $APPDIR"
-  echo " - $ENVF"
-  echo "Remove them manually if you want."
-}
-
-case "${ACTION:-}" in
-  install) do_install;;
-  status) do_status;;
-  logs) do_logs;;
-  restart) do_restart;;
-  uninstall) do_uninstall;;
-  *) cat <<USAGE
-Usage:
-  sudo bash api.sh --install [--port=8088 --user=admin --pass=pass --secret=changeme --logo=URL]
-  sudo bash api.sh --status | --logs | --restart | --uninstall
-USAGE
-     ;;
+# ===== Actions =====
+case "$ACTION" in
+  install)
+    ask_credentials
+    info "📦 Installing ZI One-Time Key API…"
+    install_pkgs
+    write_app_py
+    write_env
+    write_unit
+    if command -v ufw >/dev/null 2>&1; then ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true; fi
+    start_service
+    sleep 1
+    IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    ok "✅ Installation complete!"
+    echo "Root URL    : http://${IP:-<SERVER_IP>}:${PORT}/"
+    echo "Admin Login : http://${IP:-<SERVER_IP>}:${PORT}/login"
+    echo "Admin Panel : http://${IP:-<SERVER_IP>}:${PORT}/admin   (login first)"
+    echo "Health      : curl -s http://127.0.0.1:${PORT}/api/health"
+    ;;
+  restart)
+    systemctl restart zi-keyapi.service && ok "restarted."
+    ;;
+  status)
+    systemctl --no-pager -l status zi-keyapi.service
+    ;;
+  logs)
+    journalctl -u zi-keyapi.service -n 200 --no-pager
+    ;;
+  uninstall)
+    systemctl disable --now zi-keyapi.service 2>/dev/null || true
+    rm -f "$UNIT" "$ENVF"
+    systemctl daemon-reload
+    ok "Removed service. App dir kept at $APPDIR"
+    ;;
+  *)
+    echo "Usage: --install [--secret=.. --port=.. --user=.. --pass=..] | --status | --logs | --restart | --uninstall"
+    exit 1
+    ;;
 esac
