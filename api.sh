@@ -1,13 +1,13 @@
 #!/bin/bash
-# ZI One-Time Key API (Login UI) — rewritten single-file installer
-# Author: UPK helper
+# ZI One-Time Key API (Login UI) — installer (prompts for user/pass if not given)
 # Usage:
-#   sudo bash api.sh --install [--port=8088 --user=admin --pass=pass --secret=changeme --logo=URL]
+#   sudo bash api.sh --install [--port=8088] [--secret=changeme] [--logo=URL] [--ip=1.2.3.4]
+#   sudo bash api.sh --install --user=upk123 --pass=123123   # skip prompts
 #   sudo bash api.sh --status | --logs | --restart | --uninstall
 
 set -euo pipefail
 
-# ===== Defaults =====
+# Defaults
 SECRET="changeme"
 PORT="8088"
 DB="/var/lib/upkapi/keys.db"
@@ -15,17 +15,16 @@ BIND="0.0.0.0"
 APPDIR="/opt/zi-keyapi"
 ENVF="/etc/default/zi-keyapi"
 UNIT="/etc/systemd/system/zi-keyapi.service"
-LOGO_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png"
-
-CLI_USER=""
-CLI_PASS=""
+LOGO_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/main/20251018_231111.png"
+FORCE_IP=""
+CLI_USER=""; CLI_PASS=""
 ACTION=""
 
 log(){ printf "\033[1;32m[+] \033[0m%s\n" "$*"; }
 warn(){ printf "\033[1;33m[!] \033[0m%s\n" "$*"; }
 die(){ printf "\033[1;31m[x] \033[0m%s\n" "$*"; exit 1; }
 
-# ===== Parse args =====
+# Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --install) ACTION="install"; shift;;
@@ -40,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --logo=*) LOGO_URL="${1#*=}"; shift;;
     --db=*) DB="${1#*=}"; shift;;
     --bind=*) BIND="${1#*=}"; shift;;
+    --ip=*) FORCE_IP="${1#*=}"; shift;;
     *) die "Unknown argument: $1";;
   esac
 done
@@ -47,34 +47,46 @@ done
 need_root(){ [[ $(id -u) -eq 0 ]] || die "Run as root (sudo)."; }
 
 ensure_deps(){
-  log "Installing dependencies..."
+  log "Installing dependencies (apt)..."
   apt-get update -y
-  apt-get install -y python3 python3-venv python3-pip curl jq
+  apt-get install -y python3 python3-venv python3-pip curl jq >/dev/null
+}
+
+prompt_creds_if_needed(){
+  # If CLI_USER/CLI_PASS empty and running interactively, prompt
+  if [[ -z "$CLI_USER" ]]; then
+    if [[ -t 0 ]]; then
+      read -p "Choose admin username (default: admin): " tmpu
+      CLI_USER="${tmpu:-admin}"
+    else
+      CLI_USER="admin"
+    fi
+  fi
+  if [[ -z "$CLI_PASS" ]]; then
+    if [[ -t 0 ]]; then
+      read -s -p "Choose admin password (default: pass): " tmpp
+      echo
+      CLI_PASS="${tmpp:-pass}"
+    else
+      CLI_PASS="pass"
+    fi
+  fi
 }
 
 write_env(){
   log "Writing environment file: $ENVF"
   mkdir -p "$(dirname "$ENVF")" /var/lib/upkapi
-  # Keep existing APP_SECRET_KEY if present, else generate
+  # preserve existing APP_SECRET_KEY if present
   local APP_SECRET
   if [[ -f "$ENVF" ]] && grep -q '^APP_SECRET_KEY=' "$ENVF"; then
     APP_SECRET=$(grep '^APP_SECRET_KEY=' "$ENVF" | sed 's/APP_SECRET_KEY=//')
   else
     APP_SECRET=$(python3 - <<'PY'
-import secrets; print(secrets.token_hex(32))
+import secrets
+print(secrets.token_hex(32))
 PY
 )
   fi
-
-  # If ENV already has ADMIN_/LOGIN_ creds and user didn't pass CLI creds, preserve them
-  local EXIST_USER="" EXIST_PASS=""
-  if [[ -f "$ENVF" ]]; then
-    EXIST_USER=$( (grep -E '^(ADMIN_USER|LOGIN_USER)=' "$ENVF" || true) | tail -n1 | cut -d= -f2- )
-    EXIST_PASS=$( (grep -E '^(ADMIN_PASS|LOGIN_PASS)=' "$ENVF" || true) | tail -n1 | cut -d= -f2- )
-  fi
-
-  local FINAL_USER="${CLI_USER:-${EXIST_USER:-admin}}"
-  local FINAL_PASS="${CLI_PASS:-${EXIST_PASS:-pass}}"
 
   cat > "$ENVF" <<EOF
 # Managed by api.sh
@@ -84,31 +96,30 @@ DB_PATH=${DB}
 BIND=${BIND}
 LOGO_URL=${LOGO_URL}
 APP_SECRET_KEY=${APP_SECRET}
-# Prefer ADMIN_* and keep LOGIN_* for backward compatibility
-ADMIN_USER=${FINAL_USER}
-ADMIN_PASS=${FINAL_PASS}
-LOGIN_USER=${FINAL_USER}
-LOGIN_PASS=${FINAL_PASS}
+ADMIN_USER=${CLI_USER}
+ADMIN_PASS=${CLI_PASS}
+# Backwards compatibility
+LOGIN_USER=${CLI_USER}
+LOGIN_PASS=${CLI_PASS}
 EOF
+  chmod 640 "$ENVF" || true
 }
 
 write_app(){
   log "Writing application to $APPDIR"
   install -d "$APPDIR"
 
-  # Python app
   cat > "$APPDIR/app.py" <<'PY'
 #!/usr/bin/env python3
 import os
-from flask import Flask, request, redirect, session, make_response
+from flask import Flask, request, redirect, session
 
-# --- Config from env ---
 PORT = int(os.environ.get("PORT", "8088"))
 BIND = os.environ.get("BIND", "0.0.0.0")
 LOGO_URL = os.environ.get("LOGO_URL", "")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "changeme")
 
-# Back/forward compatible env names for credentials
+# Accept either ADMIN_* or LOGIN_* env names
 LOGIN_USER = os.environ.get("ADMIN_USER") or os.environ.get("LOGIN_USER", "admin")
 LOGIN_PASS = os.environ.get("ADMIN_PASS") or os.environ.get("LOGIN_PASS", "pass")
 
@@ -129,11 +140,9 @@ h2{margin: 0 0 16px;font-size:1.35rem}
 input{width:100%;height:46px;border:1px solid var(--bd);border-radius:12px;padding:10px;margin:8px 0;background:transparent;color:inherit;font-size:1rem}
 button{width:100%;height:48px;border:0;border-radius:12px;background:linear-gradient(108deg,var(--brand),var(--brand2));color:#fff;font-weight:800;margin-top:6px}
 .err{color:#f87171;margin-bottom:8px}
-a, a:visited{color:#9ecbff;text-decoration:none}
 .footer{opacity:.6;font-size:.85rem;margin-top:14px}
 </style></head><body>
 """
-
 HTML_FOOT = """<div class="footer">© ZI Key API</div></body></html>"""
 
 def render_login(err=None):
@@ -145,6 +154,163 @@ def render_login(err=None):
         body.append(f'<div class="err">{err}</div>')
     body.append('<form method="post">')
     body.append('<input name="username" placeholder="Username" required>')
+    body.append('<input name="password" type="password" placeholder="Password" required>')
+    body.append('<button type="submit">Login</button>')
+    body.append('</form></div>')
+    return HTML_HEAD + "".join(body) + HTML_FOOT
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method == "GET":
+        return render_login()
+    u = request.form.get("username","")
+    p = request.form.get("password","")
+    if u == LOGIN_USER and p == LOGIN_PASS:
+        session["auth"] = True
+        return redirect("/")
+    return render_login("Invalid credentials")
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+def require_auth():
+    return session.get("auth") is True
+
+@app.route("/")
+def home():
+    if not require_auth():
+        return redirect("/login")
+    logo_html = f'<img class="logo" src="{LOGO_URL}" alt="logo">' if LOGO_URL else ""
+    html = HTML_HEAD + f"""
+    <div class="card">
+      {logo_html}
+      <h2>Dashboard</h2>
+      <p>Welcome, <b>{LOGIN_USER}</b> ✅</p>
+      <p><a href="/logout">Logout</a></p>
+    </div>
+    """ + HTML_FOOT
+    return html
+
+@app.route("/api/health")
+def health():
+    return {"ok": True}
+
+@app.route("/api/generate", methods=["POST"])
+def generate():
+    if request.headers.get("X-Admin-Secret") != ADMIN_SECRET:
+        return {"error":"forbidden"}, 403
+    return {"status":"ok","note":"stub"}
+
+if __name__ == "__main__":
+    app.run(host=BIND, port=PORT)
+PY
+
+  chmod +x "$APPDIR/app.py"
+
+  # venv + deps
+  if [[ ! -d "$APPDIR/venv" ]]; then
+    log "Creating virtualenv..."
+    python3 -m venv "$APPDIR/venv"
+  fi
+  log "Installing Flask in venv..."
+  "$APPDIR/venv/bin/pip" install --upgrade pip >/dev/null
+  "$APPDIR/venv/bin/pip" install flask >/dev/null
+}
+
+write_unit(){
+  log "Writing systemd unit: $UNIT"
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=ZI One-Time Key API (Login UI)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=$ENVF
+WorkingDirectory=$APPDIR
+ExecStart=$APPDIR/venv/bin/python $APPDIR/app.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+detect_ip(){
+  if [[ -n "$FORCE_IP" ]]; then
+    echo "$FORCE_IP"
+    return
+  fi
+  # try multiple sources
+  for svc in "https://api.ipify.org" "https://ifconfig.co/ip" "https://checkip.amazonaws.com"; do
+    ip=$(curl -s --max-time 5 "$svc" || true)
+    if [[ -n "$ip" ]]; then
+      echo "$ip"
+      return
+    fi
+  done
+  echo "127.0.0.1"
+}
+
+do_install(){
+  need_root
+  ensure_deps
+  prompt_creds_if_needed
+  write_env
+  write_app
+  write_unit
+  log "Enabling & starting service..."
+  systemctl enable zi-keyapi.service
+  systemctl restart zi-keyapi.service || true
+  sleep 1
+  systemctl --no-pager --full status zi-keyapi.service || true
+
+  log "Health check:"
+  set +e
+  curl -sS "http://127.0.0.1:${PORT}/api/health" || true
+  set -e
+
+  IPV="$(detect_ip)"
+  log "Done. Open: http://${IPV}:${PORT}/login"
+  echo
+  log "Saved env: $ENVF"
+  log "App dir: $APPDIR"
+}
+
+do_status(){ systemctl --no-pager --full status zi-keyapi.service; }
+do_logs(){ journalctl -u zi-keyapi.service -n 200 --no-pager; }
+do_restart(){ systemctl restart zi-keyapi.service && log "Restarted."; }
+do_uninstall(){
+  need_root
+  systemctl stop zi-keyapi.service || true
+  systemctl disable zi-keyapi.service || true
+  rm -f "$UNIT"
+  systemctl daemon-reload
+  warn "Service removed. App dir & env left in place:"
+  echo " - $APPDIR"
+  echo " - $ENVF"
+  echo "Remove them manually if you want."
+}
+
+case "${ACTION:-}" in
+  install) do_install;;
+  status) do_status;;
+  logs) do_logs;;
+  restart) do_restart;;
+  uninstall) do_uninstall;;
+  *) cat <<USAGE
+Usage:
+  sudo bash api.sh --install [--port=8088 --secret=changeme --logo=URL --ip=1.2.3.4]
+  sudo bash api.sh --install --user=upk --pass=123   # skip interactive prompts
+  sudo bash api.sh --status | --logs | --restart | --uninstall
+USAGE
+;;
+esac    body.append('<input name="username" placeholder="Username" required>')
     body.append('<input name="password" type="password" placeholder="Password" required>')
     body.append('<button type="submit">Login</button>')
     body.append('</form></div>')
