@@ -4,29 +4,37 @@ from datetime import datetime, timedelta
 
 USERS_FILE = "/etc/zivpn/users.json"
 CONFIG_FILE = "/etc/zivpn/config.json"
+TRAFFIC_FILE = "/var/lib/zivpn/traffic.json" # ZIVPN traffic data file
 LISTEN_FALLBACK = "5667"
 RECENT_SECONDS = 120
+
+# Helper function to convert bytes to human-readable format (MB or GB)
+def bytes_to_human(n_bytes):
+    if n_bytes is None: return "0 MB"
+    try: n_bytes=int(n_bytes)
+    except: return "0 MB"
+    if n_bytes < 1024 * 1024:
+        return f"{n_bytes / 1024:.2f} KB"
+    elif n_bytes < 1024 * 1024 * 1024:
+        return f"{n_bytes / (1024 * 1024):.2f} MB"
+    else:
+        return f"{n_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 # Get VPS IP Address for Show Info
 def get_vps_ip():
     try:
         result = subprocess.run("ip route get 1.1.1.1 | awk '{print $7; exit}'", shell=True, capture_output=True, text=True)
         ip = result.stdout.strip()
-        if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip):
-            return ip
-    except Exception:
-        pass
+        if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip): return ip
+    except Exception: pass
     try:
         result = subprocess.run("hostname -I | awk '{print $1}'", shell=True, capture_output=True, text=True)
         ip = result.stdout.strip()
-        if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip):
-            return ip
-    except Exception:
-        pass
+        if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip): return ip
+    except Exception: pass
     return "SERVER_IP"
 
 VPS_IP = get_vps_ip()
-# Using a neutral logo that works on light background, or fallback to text
 LOGO_URL = "https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png" 
 WEB_PORT = os.environ.get("WEB_PORT", "8080")
 
@@ -63,10 +71,14 @@ def load_users():
                 "bind_ip":u.get("bind_ip","")})
   return out
 
+def get_traffic_data():
+    """Reads ZIVPN traffic data from the dedicated file."""
+    # The traffic file stores data in bytes. Example: {"user1": 123456789, "user2": 987654321}
+    return read_json(TRAFFIC_FILE, {})
+
 def save_users(users): write_json_atomic(USERS_FILE, users)
 
-def shell(cmd):
-  return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+def shell(cmd): return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
 def get_listen_port_from_config():
   cfg=read_json(CONFIG_FILE,{})
@@ -94,22 +106,19 @@ def first_recent_src_ip(port):
 
 def status_for_user(u, listen_port):
   port=str(u.get("port","")) or listen_port
-  
   if has_recent_udp_activity_for_port(port):
     return "Online"
-  
   if u.get("bind_ip"):
      return "Offline (Locked)"
-     
   return "Offline"
 
-def _ipt(cmd): return shell(cmd)
+# IPTables functions remain the same...
 
+def _ipt(cmd): return shell(cmd)
 def ensure_limit_rules(port, ip):
   if not (port and ip): return
   _ipt(f"iptables -C INPUT -p udp --dport {port} -s {ip} -j ACCEPT 2>/dev/null") or _ipt(f"iptables -I INPUT -p udp --dport {port} -s {ip} -j ACCEPT")
   _ipt(f"iptables -C INPUT -p udp --dport {port} ! -s {ip} -j DROP 2>/dev/null") or _ipt(f"iptables -I INPUT -p udp --dport {port} ! -s {ip} -j DROP")
-
 def remove_limit_rules(port):
   if not port: return
   for _ in range(10):
@@ -117,7 +126,6 @@ def remove_limit_rules(port):
     if not chk: break
     rule=chk.replace("-A","").strip()
     _ipt(f"iptables -D INPUT {rule}")
-
 def apply_device_limits(users):
   existing_ports = {str(u.get("port","")) for u in users if str(u.get("port",""))}
   cleanup_rules_output = shell("iptables -S INPUT | grep -E ' -p udp .* --dport (6[0-9]{3}|1[0-9]{4}).* -j (ACCEPT|DROP)' || true").stdout.splitlines()
@@ -126,14 +134,13 @@ def apply_device_limits(users):
       if match and match.group(1) not in existing_ports:
           rule = line.replace("-A INPUT", "").strip()
           _ipt(f"iptables -D INPUT {rule}")
-
   for u in users:
     port=str(u.get("port","") or "")
     ip=(u.get("bind_ip","") or "").strip()
-    if port and ip:
-      ensure_limit_rules(port, ip)
-    elif port and not ip:
-      remove_limit_rules(port)
+    if port and ip: ensure_limit_rules(port, ip)
+    elif port and not ip: remove_limit_rules(port)
+
+# ... (Auth and Config sync functions remain the same) ...
 
 def login_enabled(): return bool(ADMIN_USER and ADMIN_PASS)
 def is_authed(): return session.get("auth") == True
@@ -199,7 +206,7 @@ HTML = """<!doctype html>
  th,td{border:1px solid var(--bd);padding:10px;text-align:left}
  th{background:var(--card);font-size:13px;font-weight:600}
  td{font-size:14px}
- .pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600}
+ .pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600; white-space:nowrap}
  .ok{color:#fff;background:var(--ok)}
  .bad{color:#fff;background:var(--bad)}
  .unk{color:#fff;background:var(--unk)}
@@ -241,12 +248,39 @@ HTML = """<!doctype html>
  }
 </style>
 <script>
-  function copyToClipboard(text) {
-    navigator.clipboard.writeText(text).then(function() {
-      alert('ကူးယူပြီးပါပြီ: ' + text);
-    }, function(err) {
-      console.error('Could not copy text: ', err);
-    });
+  function fallbackCopy(text) {
+    var textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.style.position = "fixed";  // Avoid scrolling to bottom
+    textArea.style.opacity = "0";
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    try {
+      var successful = document.execCommand('copy');
+      if (successful) {
+        alert('ကူးယူပြီးပါပြီ (Legacy): ' + text);
+      } else {
+        alert('ကူးယူမရပါ (Manual copy): ' + text);
+      }
+    } catch (err) {
+      alert('ကူးယူမရပါ (Error): ' + text);
+    }
+    document.body.removeChild(textArea);
+  }
+
+  function copyToClipboard(text, event) {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(function() {
+        alert('ကူးယူပြီးပါပြီ: ' + text);
+      }, function(err) {
+        console.warn('Clipboard API failed, falling back...');
+        fallbackCopy(text);
+      });
+    } else {
+      fallbackCopy(text);
+    }
+    if (event) event.preventDefault();
   }
 </script>
 </head><body>
@@ -261,31 +295,31 @@ HTML = """<!doctype html>
         <label>👤 User Name</label>
         <div class="copy-row">
             <input type="text" value="{{ info.user }}" readonly>
-            <button class="copy-btn" onclick="copyToClipboard('{{ info.user }}')">Copy</button>
+            <button class="copy-btn" onclick="copyToClipboard('{{ info.user }}', event)">Copy</button>
         </div>
         
         <label style="margin-top:12px">🔑 Password</label>
         <div class="copy-row">
             <input type="text" value="{{ info.password }}" readonly>
-            <button class="copy-btn" onclick="copyToClipboard('{{ info.password }}')">Copy</button>
+            <button class="copy-btn" onclick="copyToClipboard('{{ info.password }}', event)">Copy</button>
         </div>
         
         <label style="margin-top:12px">🔌 Port (Device Lock)</label>
         <div class="copy-row">
             <input type="text" value="{{ info.port }}" readonly>
-            <button class="copy-btn" onclick="copyToClipboard('{{ info.port }}')">Copy</button>
+            <button class="copy-btn" onclick="copyToClipboard('{{ info.port }}', event)">Copy</button>
         </div>
 
         <label style="margin-top:12px">🌐 VPS IP (Server Address)</label>
         <div class="copy-row">
             <input type="text" value="{{ info.vps_ip }}" readonly>
-            <button class="copy-btn" onclick="copyToClipboard('{{ info.vps_ip }}')">Copy</button>
+            <button class="copy-btn" onclick="copyToClipboard('{{ info.vps_ip }}', event)">Copy</button>
         </div>
         
         <label style="margin-top:12px">⏰ သက်တမ်းကုန်ဆုံးရက်</label>
         <div class="copy-row">
             <input type="text" value="{{ info.expires }}" readonly>
-            <button class="copy-btn" onclick="copyToClipboard('{{ info.expires }}')">Copy</button>
+            <button class="copy-btn" onclick="copyToClipboard('{{ info.expires }}', event)">Copy</button>
         </div>
     </div>
     <a href="{{ url_for('index') }}" class="btn btn-primary" style="margin-top:16px;width:100%;text-align:center;">🏠 Dashboard သို့ပြန်သွားရန်</a>
@@ -315,11 +349,11 @@ HTML = """<!doctype html>
       </div>
 
       <div style="margin-top:16px; border-top:1px solid var(--bd); padding-top:16px;" class="actions">
-          <form style="display:inline; flex:1" method="post" action="{{ url_for('lock_now') }}">
+          <form style="display:inline; flex:1" method="post" action="{{ url_for('lock_now', user=edit_user.user) }}">
             <input type="hidden" name="user" value="{{ edit_user.user }}">
             <button class="btn btn-success" name="op" value="lock" title="Lock to current IP" style="width:100%">Lock Now</button>
           </form>
-          <form style="display:inline; flex:1" method="post" action="{{ url_for('lock_now') }}">
+          <form style="display:inline; flex:1" method="post" action="{{ url_for('lock_now', user=edit_user.user) }}">
             <input type="hidden" name="user" value="{{ edit_user.user }}">
             <button class="btn btn-del" name="op" value="clear" title="Clear lock" style="width:100%">Clear Lock</button>
           </form>
@@ -338,7 +372,7 @@ HTML = """<!doctype html>
    </div>
    <div class="row">
      <a class="btn" href="https://m.me/upkvpnfastvpn" target="_blank" rel="noopener">💬 Messenger</a>
-     <form method="post" action="{{ url_for('refresh_status') }}"><button class="btn" type="submit">🔄 Scan Status</button></form>
+     <form method="post" action="{{ url_for('refresh_status', filter=filter_type) }}"><button class="btn btn-primary" type="submit">🔄 Scan Status</button></form>
      {% if authed %}<a class="btn" href="/logout">Logout</a>{% endif %}
    </div>
  </div>
@@ -356,6 +390,7 @@ HTML = """<!doctype html>
   </div>
 {% else %}
 
+{% if filter_type == 'all' %}
 <div class="box">
   <h3 style="margin:4px 0 8px">➕ အသုံးပြုသူ အသစ်ထည့်ရန်</h3>
   {% if msg %}<div style="color:var(--succ);margin:6px 0">{{msg}}</div>{% endif %}
@@ -368,17 +403,19 @@ HTML = """<!doctype html>
       <div><label>🔌 UDP Port (Auto)</label><input name="port" placeholder="auto"></div>
       <div><label>📱 Bind IP (1 device)</label><input name="bind_ip" placeholder="auto when online…"></div>
     </div>
-    <div class="form-inline-full-width">
+    <div class="form-inline-full-width"> 
         <button class="btn btn-success" type="submit" style="margin-top:12px;width:100%">Save & Show Info</button>
     </div>
   </form>
 </div>
+{% endif %}
 
 <table>
   <thead>
   <tr>
     <th>👤 User</th><th>🔑 Password</th><th>⏰ Expires</th>
-    <th>🔌 Port</th><th>📱 Bind IP</th><th>🔎 Status</th><th>⚙️ Actions</th>
+    <th>📊 Data Usage</th>
+    <th>🔎 Status</th><th>⚙️ Actions</th>
   </tr>
   </thead>
   <tbody>
@@ -387,10 +424,7 @@ HTML = """<!doctype html>
     <td>{{u.user}}</td>
     <td>{{u.password}}</td>
     <td style="white-space:nowrap">{% if u.expires %}{{u.expires}}{% else %}<span class="muted">—</span>{% endif %}</td>
-    <td>{% if u.port %}{{u.port}}{% else %}<span class="muted">—</span>{% endif %}</td>
-    <td>
-      {% if u.bind_ip %}<span class="pill locked">{{u.bind_ip}}</span>{% else %}<span class="muted">—</span>{% endif %}
-    </td>
+    <td><span class="muted">{{ u.traffic }}</span></td>
     <td>
       {% if u.status == "Online" %}<span class="pill ok">Online</span>
       {% elif u.status.startswith("Offline") %}<span class="pill bad">Offline</span>
@@ -398,10 +432,10 @@ HTML = """<!doctype html>
       {% endif %}
     </td>
     <td class="actions">
-      <a class="btn btn-primary" href="{{ url_for('edit_user', user=u.user) }}" style="width:60px">✏️ Edit</a>
+      <a class="btn btn-primary" href="{{ url_for('edit_user', user=u.user) }}" style="width:60px; padding:6px 8px;">✏️ Edit</a>
       <form class="delform" method="post" action="{{ url_for('delete_user_html') }}" onsubmit="return confirm('{{u.user}} ကို ဖျက်မလား?')">
         <input type="hidden" name="user" value="{{u.user}}">
-        <button type="submit" class="btn btn-del" style="width:60px">🗑️ Delete</button>
+        <button type="submit" class="btn btn-del" style="width:60px; padding:6px 8px;">🗑️ Delete</button>
       </form>
     </td>
   </tr>
@@ -447,11 +481,11 @@ def build_view(msg="", err="", info_user=None, edit_user_data=None):
     return render_template_string(HTML, authed=False, logo=LOGO_URL, err=session.pop("login_err", None))
   
   users=load_users()
+  traffic_data = get_traffic_data()
   changed=False
   today_str=datetime.now().strftime("%Y-%m-%d")
   listen_port=get_listen_port_from_config()
   
-  # Auto-Lock and determine status for all users
   processed_users = []
   online_count = 0
   expired_count = 0
@@ -471,13 +505,18 @@ def build_view(msg="", err="", info_user=None, edit_user_data=None):
     if is_online: online_count += 1
     if is_expired: expired_count += 1
     
+    # Get Traffic Data
+    traffic_bytes = traffic_data.get(u.get("user"), 0)
+    traffic_human = bytes_to_human(traffic_bytes)
+    
     processed_users.append(type("U",(),{
       "user":u.get("user",""),
       "password":u.get("password",""),
       "expires":u.get("expires",""),
       "port":u.get("port",""),
       "bind_ip":u.get("bind_ip",""),
-      "status":current_status
+      "status":current_status,
+      "traffic":traffic_human # New field
     }))
     
   if changed: save_users(users)
@@ -501,7 +540,8 @@ def build_view(msg="", err="", info_user=None, edit_user_data=None):
                                 online_count=online_count, 
                                 expired_count=expired_count)
 
-# The rest of the routes remain largely the same, only ensuring they redirect to index() properly.
+# --- Routes (mostly remain the same, ensuring filter is preserved on refresh/redirect) ---
+
 @app.route("/refresh_status", methods=["POST"])
 def refresh_status():
     if not require_login(): return redirect(url_for('login'))
@@ -509,6 +549,7 @@ def refresh_status():
 
 @app.route("/login", methods=["GET","POST"])
 def login():
+  # ... (login logic) ...
   if not login_enabled(): return redirect(url_for('index'))
   if request.method=="POST":
     u=(request.form.get("u") or "").strip()
@@ -529,6 +570,7 @@ def index(): return build_view()
 @app.route("/add", methods=["POST"])
 def add_user():
   if not require_login(): return redirect(url_for('login'))
+  # ... (add user logic remains the same) ...
   user=(request.form.get("user") or "").strip()
   password=(request.form.get("password") or "").strip()
   expires=(request.form.get("expires") or "").strip()
@@ -539,8 +581,7 @@ def add_user():
     try: expires=(datetime.now() + timedelta(days=int(expires))).strftime("%Y-%m-%d")
     except Exception: pass
 
-  if not user or not password:
-    return build_view(err="User နှင့် Password လိုအပ်သည်")
+  if not user or not password: return build_view(err="User နှင့် Password လိုအပ်သည်")
   if expires:
     try: datetime.strptime(expires,"%Y-%m-%d")
     except ValueError: return build_view(err="Expires format မမှန်ပါ (YYYY-MM-DD)")
@@ -583,6 +624,7 @@ def edit_user():
     return build_view(edit_user_data=target[0])
     
   orig=(request.form.get("orig") or "").strip().lower()
+  # ... (save logic remains the same) ...
   user=(request.form.get("user") or "").strip()
   password=(request.form.get("password") or "").strip()
   expires=(request.form.get("expires") or "").strip()
@@ -612,7 +654,7 @@ def edit_user():
   if not found: return build_view(err="မတွေ့ပါ")
   
   save_users(users); sync_config_passwords(); apply_device_limits(users)
-  return redirect(url_for('index'))
+  return redirect(url_for('index', filter=request.args.get('filter', 'all')))
 
 @app.route("/lock", methods=["POST"])
 def lock_now():
@@ -649,6 +691,7 @@ def delete_user_html():
   if not require_login(): return redirect(url_for('login'))
   user = (request.form.get("user") or "").strip()
   if not user: return build_view(err="User လိုအပ်သည်")
+  # ... (delete logic remains the same) ...
   remain=[]; removed=None
   for u in load_users():
     if u.get("user","").lower()==user.lower():
@@ -657,18 +700,7 @@ def delete_user_html():
       remain.append(u)
   if removed and removed.get("port"): remove_limit_rules(removed.get("port"))
   save_users(remain); sync_config_passwords(mode="mirror")
-  return build_view(msg=f"Deleted: {user}")
-
-@app.route("/api/users", methods=["GET","POST"])
-def api_users():
-  # API endpoint for future use. Not fully implemented based on user request.
-  if not require_login():
-    return make_response(jsonify({"ok": False, "err":"login required"}), 401)
-  
-  users=load_users(); listen_port=get_listen_port_from_config()
-  for u in users: u["status"]=status_for_user(u,listen_port)
-  
-  return jsonify(users)
+  return build_view(msg=f"Deleted: {user}", filter_type=request.args.get('filter', 'all'))
 
 @app.route("/favicon.ico", methods=["GET"])
 def favicon(): return ("",204)
