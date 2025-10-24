@@ -1,4 +1,4 @@
-sudo bash -c 'cat > /etc/zivpn/web.py << "PY"
+
 from flask import Flask, jsonify, render_template_string, request, redirect, url_for, session, make_response
 import json, subprocess, os, tempfile, hmac, re
 from datetime import datetime, timedelta
