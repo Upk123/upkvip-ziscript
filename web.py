@@ -1,3 +1,4 @@
+sudo bash -lc 'cat > /etc/zivpn/web.py <<'"'"'PY'"'"'
 from flask import Flask, jsonify, render_template_string, request, redirect, url_for, session, make_response
 import json, subprocess, os, tempfile, hmac, re
 from datetime import datetime, timedelta
@@ -33,7 +34,7 @@ def write_json_atomic(path, data):
         try: os.remove(tmp)
         except: pass
 
-def shell(cmd):  # returns CompletedProcess
+def shell(cmd):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
 def get_listen_port_from_config():
@@ -68,17 +69,15 @@ def pick_free_port():
         if str(p) not in used: return str(p)
     return ""
 
-def _ct_recent_line_for_port(port):
-    # Narrow first by dport then accept both directions, take first recent
-    cmd = f"conntrack -L -p udp 2>/dev/null | grep -w 'dport={port}' | head -n1 || true"
-    return shell(cmd).stdout.strip()
+def _ct_line(port):
+    return shell(f"conntrack -L -p udp 2>/dev/null | grep -w \"dport={port}\" | head -n1 || true").stdout.strip()
 
 def has_recent_udp_activity_for_port(port):
-    return bool(_ct_recent_line_for_port(port))
+    return bool(_ct_line(port))
 
 def first_recent_src_ip(port):
     if not port: return ""
-    out=_ct_recent_line_for_port(port)
+    out=_ct_line(port)
     if not out: return ""
     m=re.search(r"\bsrc=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\b", out)
     ip=m.group(1) if m else ""
@@ -100,7 +99,6 @@ def ensure_limit_rules(port, ip):
 
 def remove_limit_rules(port):
     if not port: return
-    # remove both ACCEPT/DROP rules for this dport
     while True:
         chk=_ipt(f"iptables -S INPUT | grep -E \"-p udp .* --dport {port}\\b .* (-j DROP|-j ACCEPT)\" | head -n1 || true").stdout.strip()
         if not chk: break
@@ -183,7 +181,6 @@ HTML = """<!doctype html>
  .form-inline{display:flex;gap:10px;flex-wrap:wrap}
  .form-inline > div{min-width:180px;flex:1}
  .footer-save{position:sticky;bottom:8px}
- /* modal */
  .modal{position:fixed;inset:0;display:none;background:rgba(0,0,0,.55);backdrop-filter:blur(2px);align-items:center;justify-content:center;z-index:20}
  .modal .card{width:min(92vw,520px);background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:16px}
  .modal .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
@@ -256,9 +253,7 @@ HTML = """<!doctype html>
       {% else %}<span class="pill unk">Unknown</span>
       {% endif %}
     </td>
-    <td>
-      <button type="button" class="btn" onclick="openEdit('{{u.user}}');return false;">✏️</button>
-    </td>
+    <td><button type="button" class="btn" onclick="openEdit('{{u.user}}');return false;">✏️</button></td>
     <td>
       <form method="post" action="/delete" onsubmit="return confirm('ဖျက်မလား?')" style="display:inline">
         <input type="hidden" name="user" value="{{u.user}}">
@@ -269,7 +264,6 @@ HTML = """<!doctype html>
   {% endfor %}
 </table>
 
-<!-- ===== Modal Edit ===== -->
 <div class="modal" id="editModal">
   <div class="card">
     <div class="head">
@@ -293,32 +287,32 @@ HTML = """<!doctype html>
 <script>
 async function openEdit(user){
   try{
-    const r = await fetch('/api/user.get?user='+encodeURIComponent(user));
+    const r = await fetch("/api/user.get?user="+encodeURIComponent(user));
     const j = await r.json();
-    if(!j || !j.user){alert('Not found');return}
-    document.getElementById('orig').value = j.user;
-    document.getElementById('e_user').value = j.user||'';
-    document.getElementById('e_password').value = j.password||'';
-    document.getElementById('e_expires').value = j.expires||'';
-    document.getElementById('e_port').value = j.port||'';
-    document.getElementById('e_bind').value = j.bind_ip||'';
-    document.getElementById('editModal').style.display='flex';
-  }catch(e){ alert('Error'); }
+    if(!j || !j.user){alert("Not found");return}
+    document.getElementById("orig").value = j.user;
+    document.getElementById("e_user").value = j.user||"";
+    document.getElementById("e_password").value = j.password||"";
+    document.getElementById("e_expires").value = j.expires||"";
+    document.getElementById("e_port").value = j.port||"";
+    document.getElementById("e_bind").value = j.bind_ip||"";
+    document.getElementById("editModal").style.display="flex";
+  }catch(e){ alert("Error"); }
 }
-function closeEdit(){ document.getElementById('editModal').style.display='none'; }
+function closeEdit(){ document.getElementById("editModal").style.display="none"; }
 async function saveEdit(ev){
   ev.preventDefault();
   const body={
-    orig: document.getElementById('orig').value,
-    user: document.getElementById('e_user').value.trim(),
-    password: document.getElementById('e_password').value.trim(),
-    expires: document.getElementById('e_expires').value.trim(),
-    port: document.getElementById('e_port').value.trim(),
-    bind_ip: document.getElementById('e_bind').value.trim()
+    orig: document.getElementById("orig").value,
+    user: document.getElementById("e_user").value.trim(),
+    password: document.getElementById("e_password").value.trim(),
+    expires: document.getElementById("e_expires").value.trim(),
+    port: document.getElementById("e_port").value.trim(),
+    bind_ip: document.getElementById("e_bind").value.trim()
   };
-  const r = await fetch('/api/user.save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const r = await fetch("/api/user.save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const j = await r.json();
-  if(j && j.ok){ closeEdit(); location.reload(); } else { alert(j.err||'Failed'); }
+  if(j && j.ok){ closeEdit(); location.reload(); } else { alert(j.err||"Failed"); }
   return false;
 }
 </script>
@@ -335,13 +329,11 @@ def build_view(msg="", err=""):
 
     users=load_users()
 
-    # auto-capture bind_ip if currently online but empty
     changed=False
     for u in users:
         if u.get("port") and not u.get("bind_ip"):
             ip=first_recent_src_ip(u["port"])
-            if ip:
-                u["bind_ip"]=ip; changed=True
+            if ip: u["bind_ip"]=ip; changed=True
     if changed: save_users(users)
 
     apply_device_limits(users)
@@ -349,16 +341,14 @@ def build_view(msg="", err=""):
     active=get_udp_listen_ports()
     listen_port=get_listen_port_from_config()
 
-    view=[]
-    online=offline=unknown=expired=0
+    view=[]; online=offline=unknown=expired=0
     today=datetime.now().strftime("%Y-%m-%d")
     for u in users:
         st=status_for_user(u,active,listen_port)
         if st=="Online": online+=1
         elif st=="Offline": offline+=1
         else: unknown+=1
-        if u.get("expires") and str(u["expires"])<=today:
-            expired+=1
+        if u.get("expires") and str(u["expires"])<=today: expired+=1
         view.append(type("U",(),{
             "user":u.get("user",""),
             "password":u.get("password",""),
@@ -373,32 +363,32 @@ def build_view(msg="", err=""):
 
 # ===== Routes =====
 @app.route("/scan", methods=["GET"])
-def scan():  # refresh device limits + quick redirect
+def scan():
     apply_device_limits(load_users())
-    return redirect(url_for('index'))
+    return redirect(url_for("index"))
 
 @app.route("/login", methods=["GET","POST"])
 def login():
-    if not login_enabled(): return redirect(url_for('index'))
+    if not login_enabled(): return redirect(url_for("index"))
     if request.method=="POST":
         u=(request.form.get("u") or "").strip()
         p=(request.form.get("p") or "").strip()
         if hmac.compare_digest(u, ADMIN_USER) and hmac.compare_digest(p, ADMIN_PASS):
-            session["auth"]=True; return redirect(url_for('index'))
-        session["auth"]=False; session["login_err"]="မှန်ကန်မှုမရှိပါ (username/password)"; return redirect(url_for('login'))
+            session["auth"]=True; return redirect(url_for("index"))
+        session["auth"]=False; session["login_err"]="မှန်ကန်မှုမရှိပါ (username/password)"; return redirect(url_for("login"))
     return render_template_string(HTML, authed=False, logo=LOGO_URL, err=session.pop("login_err", None))
 
 @app.route("/logout", methods=["GET"])
 def logout():
     session.pop("auth", None)
-    return redirect(url_for('login') if login_enabled() else url_for('index'))
+    return redirect(url_for("login") if login_enabled() else url_for("index"))
 
 @app.route("/", methods=["GET"])
 def index(): return build_view()
 
 @app.route("/add", methods=["POST"])
 def add_user():
-    if not require_login(): return redirect(url_for('login'))
+    if not require_login(): return redirect(url_for("login"))
     user=(request.form.get("user") or "").strip()
     password=(request.form.get("password") or "").strip()
     expires=(request.form.get("expires") or "").strip()
@@ -429,7 +419,7 @@ def add_user():
 
 @app.route("/delete", methods=["POST"])
 def delete_user_html():
-    if not require_login(): return redirect(url_for('login'))
+    if not require_login(): return redirect(url_for("login"))
     user = (request.form.get("user") or "").strip()
     if not user: return build_view(err="User လိုအပ်သည်")
     remain=[]; removed=None
@@ -491,7 +481,11 @@ def api_users():
 def favicon(): return ("",204)
 
 @app.errorhandler(405)
-def handle_405(e): return redirect(url_for('index'))
+def handle_405(e): return redirect(url_for("index"))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+PY
+sed -i "s/\r$//" /etc/zivpn/web.py
+systemctl restart zivpn-web
+'
