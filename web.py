@@ -257,7 +257,7 @@ HTML = """<!doctype html>
       {% endif %}
     </td>
     <td>
-      <button class="btn" onclick="openEdit('{{u.user}}')">✏️</button>
+      <button type="button" class="btn" onclick="openEdit('{{u.user}}');return false;">✏️</button>
     </td>
     <td>
       <form method="post" action="/delete" onsubmit="return confirm('ဖျက်မလား?')" style="display:inline">
