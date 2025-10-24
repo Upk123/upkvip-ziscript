@@ -151,7 +151,7 @@ WantedBy=multi-user.target
 EOF
 
 # ===== Web Panel: download web.py from your repo (NO HEREDOC) =====
-WEBPY_URL="${WEBPY_URL:-https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/web.py}"
+WEBPY_URL="${WEBPY_URL:-https://raw.githubusercontent.com/Upk123/upkvip-ziscript/main/web.py}"
 say "${Y}🖥️ web.py ကို repo မှ ယူပြီး သွင်းနေ...${Z}"
 if ! curl -fsSL "$WEBPY_URL" -o /etc/zivpn/web.py; then
   echo -e "${R}❌ web.py ဒေါင်းလို့မရ — URL စစ်ပါ: $WEBPY_URL${Z}"; exit 3
