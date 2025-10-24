@@ -1,1178 +1,575 @@
 #!/bin/bash
-# ZIVPN UDP Server Installation Script (Modified by Gemini AI - Original API Grep/Cut Logic Reinstated)
+# ZIVPN UDP Server + Web UI Installer (Myanmar) — One-Device Lock + Edit UI
+# - Keeps your API server UNCHANGED. Uses KEY_API_URL:/api/consume only.
+# - Android-friendly UI, per-user Edit, one-device limit via iptables.
+# - Services: zivpn.service, zivpn-web.service
 
-# --- CONFIGURATION ---
-PYTHON_APP_PATH="/etc/zivpn/web.py"
-ENV_FILE="/etc/zivpn/web.env"
-SYSTEMD_SERVICE_FILE="/etc/systemd/system/zivpn-web.service"
-# Original API endpoint
-API_SERVER="http://43.229.135.219:8088"
-# ---------------------
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
-echo "--- ZIVPN Server Setup ---"
+B="\e[1;34m"; G="\e[1;32m"; Y="\e[1;33m"; R="\e[1;31m"; C="\e[1;36m"; Z="\e[0m"
+LINE="${B}────────────────────────────────────────────────────────${Z}"
+say(){ echo -e "$1"; }
 
-# 1. Install Dependencies
-echo "Installing Python and required packages..."
-apt update
-# python3-apt for apt_pkg import fix
-# jq removed to use original grep/cut logic
-apt install -y python3 python3-pip curl netfilter-persistent python3-apt
+echo -e "\n$LINE\n${G}🌟 ZIVPN UDP Server + Web UI ကို ထည့်သွင်းနေသည်${Z}\n$LINE"
 
-# Stop ZIVPN service if running to prevent errors during config
-systemctl stop zivpn.service 2>/dev/null || true
-
-pip3 install flask
-
-# 2. Check and Apply One-Time Key Logic (REINSTATED with Original Grep/Cut)
-echo ""
-echo "--- One-Time Key Check ---"
-read -p "Please Enter One-Time Key: " KEY_INPUT
-KEY_INPUT=$(echo "$KEY_INPUT" | tr -d '[:space:]')
-SERVER_IP=$(curl -s ifconfig.me)
-
-if [ -z "$KEY_INPUT" ]; then
-    echo "Error: Key cannot be empty."
-    exit 1
+# ===== Root check =====
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "${R}❌ root အဖြစ် chạy ပါ (sudo -i)${Z}"; exit 1
 fi
 
-echo "Checking Key with API Server: $API_SERVER/usekey"
-# REINSTATED: Using original grep/cut logic that previously worked
-API_RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"key\": \"$KEY_INPUT\", \"ip\": \"$SERVER_IP\"}" "$API_SERVER/usekey")
-STATUS=$(echo "$API_RESPONSE" | grep -o '"status":"[^"]*"' | cut -d':' -f2 | tr -d '"')
-MESSAGE=$(echo "$API_RESPONSE" | grep -o '"message":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+# ======= ONE-TIME KEY GATE (API UNCHANGED; call /api/consume) =======
+KEY_API_URL="${KEY_API_URL:-http://43.229.135.219:8088}"   # <- မိမိ API URL ရှိရင် ENV ကနေ override လုပ်နိုင်
+consume_one_time_key() {
+  local _key="$1" _url="${KEY_API_URL%/}/api/consume" resp
+  command -v curl >/dev/null 2>&1 || { echo -e "${R}curl မရှိ — apt install -y curl${Z}"; exit 2; }
+  echo -e "${Y}🔑 One-time key စစ်နေ...${Z}"
+  set +e
+  resp=$(curl -fsS -X POST "$_url" -H 'Content-Type: application/json' -d "{\"key\":\"${_key}\"}")
+  rc=$?
+  set -e
+  if [ $rc -ne 0 ]; then echo -e "${R}❌ Key server မချိတ်ဘူး${Z}"; exit 2; fi
+  if echo "$resp" | grep -q '"ok":\s*true'; then
+    echo -e "${G}✅ Key မှန် (consumed) — ဆက်လုပ်မယ်${Z}"
+  else
+    echo -e "${R}❌ Key မမှန်/ပြီးသုံးပြီး:${Z} $resp"; return 1
+  fi
+}
+while :; do
+  echo -ne "${C}Enter one-time key: ${Z}"
+  read -r -s ONE_TIME_KEY; echo
+  [ -z "${ONE_TIME_KEY:-}" ] && { echo -e "${Y}⚠️ key မထည့်ရသေး — ထပ်ထည့်ပါ${Z}"; continue; }
+  consume_one_time_key "$ONE_TIME_KEY" && break || echo -e "${Y}🔁 ထပ်စမ်းပါ${Z}"
+done
 
-# Check if the API returned a non-JSON/HTML response (like the 404 seen before)
-if echo "$API_RESPONSE" | grep -q "<html>"; then
-    echo "API Authorization Failed! Server returned HTML/Error page."
-    echo "Raw Response (Partial): ${API_RESPONSE:0:150}..."
-    exit 1
-fi
+# ======= apt guard & packages =======
+wait_for_apt(){ for _ in $(seq 1 60); do
+  if pgrep -x apt >/dev/null || pgrep -x apt-get >/dev/null || pgrep -f 'apt.systemd.daily' >/dev/null || pgrep -x unattended-upgrade >/dev/null; then sleep 5; else return 0; fi
+done; }
+CNF_CONF="/etc/apt/apt.conf.d/50command-not-found"
+apt_guard_start(){ wait_for_apt; if [ -f "$CNF_CONF" ]; then mv "$CNF_CONF" "${CNF_CONF}.disabled"; CNF_DISABLED=1; else CNF_DISABLED=0; fi; }
+apt_guard_end(){ dpkg --configure -a >/dev/null 2>&1 || true; apt-get -f install -y >/dev/null 2>&1 || true; if [ "${CNF_DISABLED:-0}" = 1 ] && [ -f "${CNF_CONF}.disabled" ]; then mv "${CNF_CONF}.disabled" "$CNF_CONF"; fi; }
 
-if [ "$STATUS" == "success" ]; then
-    echo "Key successfully authorized! Message: $MESSAGE"
-elif [ "$STATUS" == "error" ]; then
-    echo "Error: Key authorization failed. Message: $MESSAGE"
-    exit 1
-else
-    # This handles cases where STATUS is empty or invalid (e.g., API is offline or response is corrupt)
-    echo "Error: Key authorization failed. Unknown Status or Corrupt Response."
-    echo "Raw Response: $API_RESPONSE"
-    exit 1
-fi
+say "${Y}📦 Packages တင်နေ...${Z}"
+apt_guard_start
+apt-get update -y -o APT::Update::Post-Invoke::= >/dev/null
+apt-get install -y curl ufw jq python3 python3-flask python3-apt iproute2 conntrack ca-certificates openssl >/dev/null
+apt_guard_end
 
-# 3. Get Admin Credentials
-echo ""
-echo "--- Web Admin Panel Setup ---"
-read -p "Enter new Admin Username: " ADMIN_USER
-read -s -p "Enter new Admin Password: " ADMIN_PASS
-echo ""
-
-# Save credentials to ENV file (chmod 600 ensures only root can read)
+# ======= Paths =======
+BIN="/usr/local/bin/zivpn"
+CFG="/etc/zivpn/config.json"
+USERS="/etc/zivpn/users.json"
+ENVF="/etc/zivpn/web.env"
 mkdir -p /etc/zivpn
-echo "ADMIN_USER='${ADMIN_USER}'" > "$ENV_FILE"
-echo "ADMIN_PASS='${ADMIN_PASS}'" >> "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-echo "Admin credentials saved to ${ENV_FILE}"
 
-# 4. Create the New web.py (Python Flask App)
-# web.py content remains the same (UI, Limit, Edit features, sync_conn_limits)
-cat << 'EOF_PYTHON' > "$PYTHON_APP_PATH"
-# /etc/zivpn/web.py (Modified by Gemini AI for enhanced UI and features)
-from flask import Flask, request, redirect, url_for, render_template_string
+# ======= Download ZIVPN binary =======
+say "${Y}⬇️ ZIVPN binary ဒေါင်းနေ...${Z}"
+PRIMARY_URL="https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64"
+FALLBACK_URL="https://github.com/zahidbd2/udp-zivpn/releases/latest/download/udp-zivpn-linux-amd64"
+TMP_BIN="$(mktemp)"
+if ! curl -fsSL -o "$TMP_BIN" "$PRIMARY_URL"; then
+  echo -e "${Y}Primary မရ — latest ဆက်စမ်း...${Z}"
+  curl -fSL -o "$TMP_BIN" "$FALLBACK_URL"
+fi
+install -m 0755 "$TMP_BIN" "$BIN"; rm -f "$TMP_BIN"
+
+# ======= Base config =======
+if [ ! -f "$CFG" ]; then
+  say "${Y}🧩 config.json ဖန်တီးနေ...${Z}"
+  curl -fsSL -o "$CFG" "https://raw.githubusercontent.com/zahidbd2/udp-zivpn/main/config.json" || echo '{}' > "$CFG"
+fi
+
+# ======= Self-signed certs =======
+if [ ! -f /etc/zivpn/zivpn.crt ] || [ ! -f /etc/zivpn/zivpn.key ]; then
+  say "${Y}🔐 SSL ဖန်တီးနေ...${Z}"
+  openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 \
+    -subj "/C=MM/ST=Yangon/L=Yangon/O=UPK/OU=Net/CN=zivpn" \
+    -keyout "/etc/zivpn/zivpn.key" -out "/etc/zivpn/zivpn.crt" >/dev/null 2>&1
+fi
+
+# ======= Web Admin (optional) =======
+say "${Y}🔒 Web Admin Login UI ထည့်မလား? (Enter = disable)${Z}"
+read -r -p "Web Admin Username: " WEB_USER
+if [ -n "${WEB_USER:-}" ]; then
+  read -r -s -p "Web Admin Password: " WEB_PASS; echo
+  if command -v openssl >/dev/null 2>&1; then WEB_SECRET="$(openssl rand -hex 32)"; else WEB_SECRET="$(python3 - <<'PY'\nimport secrets;print(secrets.token_hex(32))\nPY\n)"; fi
+  printf "WEB_ADMIN_USER=%s\nWEB_ADMIN_PASSWORD=%s\nWEB_SECRET=%s\n" "$WEB_USER" "$WEB_PASS" "$WEB_SECRET" > "$ENVF"
+  chmod 600 "$ENVF"; say "${G}✅ Web login UI ဖွင့်ထားသည်${Z}"
+else
+  rm -f "$ENVF" 2>/dev/null || true
+  say "${Y}ℹ️ Web login UI မဖွင့်ထားပါ (dev mode)${Z}"
+fi
+
+# ======= Initial passwords =======
+say "${G}🔏 VPN Password List (ကော်မာဖြင့်ခွဲ) eg: upkvip,alice,pass1${Z}"
+read -r -p "Passwords (Enter=zi): " input_pw
+if [ -z "${input_pw:-}" ]; then
+  PW_LIST='["zi"]'
+else
+  PW_LIST=$(echo "$input_pw" | awk -F',' '{
+    printf("["); for(i=1;i<=NF;i++){gsub(/^ *| *$/,"",$i); printf("%s\"%s\"", (i>1?",":""), $i)}; printf("]")
+  }')
+fi
+
+# ======= Update config.json =======
+if jq . >/dev/null 2>&1 <<<'{}'; then
+  TMP=$(mktemp)
+  jq --argjson pw "$PW_LIST" '
+    .auth.mode = "passwords" |
+    .auth.config = $pw |
+    .listen = (."listen" // ":5667") |
+    .cert = "/etc/zivpn/zivpn.crt" |
+    .key  = "/etc/zivpn/zivpn.key" |
+    .obfs = (."obfs" // "zivpn")
+  ' "$CFG" > "$TMP" && mv "$TMP" "$CFG"
+fi
+[ -f "$USERS" ] || echo "[]" > "$USERS"
+chmod 644 "$CFG" "$USERS"
+
+# ======= systemd: ZIVPN =======
+say "${Y}🧰 systemd service (zivpn) သွင်းနေ...${Z}"
+cat >/etc/systemd/system/zivpn.service <<'EOF'
+[Unit]
+Description=ZIVPN UDP Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/zivpn
+ExecStart=/usr/local/bin/zivpn server -c /etc/zivpn/config.json
+Restart=always
+RestartSec=3
+Environment=ZIVPN_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ======= Flask Web UI (Android-friendly + Edit + One-Device Lock) =======
+say "${Y}🖥️ Web Panel (Flask) ထည့်နေ...${Z}"
+cat >/etc/zivpn/web.py <<'PY'
+from flask import Flask, jsonify, render_template_string, request, redirect, url_for, session, make_response
+import json, subprocess, os, tempfile, hmac, re
 from datetime import datetime, timedelta
-import json, os, hashlib, subprocess, re, time
 
-# --- Configuration & Files ---
-CONFIG_FILE = "/etc/zivpn/config.json"
 USERS_FILE = "/etc/zivpn/users.json"
-ENV_FILE = "/etc/zivpn/web.env"
-LOGO_URL = "https://example.com/logo.png" # Replace with your logo URL
-IPTABLES_CHAIN = "ZIVPN_LIMIT"
+CONFIG_FILE = "/etc/zivpn/config.json"
+LISTEN_FALLBACK = "5667"
+LOGO_URL = "https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png"
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("WEB_SECRET","dev-secret-change-me")
+ADMIN_USER = os.environ.get("WEB_ADMIN_USER","").strip()
+ADMIN_PASS = os.environ.get("WEB_ADMIN_PASSWORD","").strip()
 
-# --- Utility Functions ---
+def read_json(path, default):
+  try:
+    with open(path,"r") as f: return json.load(f)
+  except Exception:
+    return default
 
-def load_env():
-    env = {}
-    if os.path.exists(ENV_FILE):
-        with open(ENV_FILE, 'r') as f:
-            for line in f:
-                if '=' in line:
-                    key, value = line.strip().split('=', 1)
-                    env[key] = value.strip("'\"")
-    return env
+def write_json_atomic(path, data):
+  d=json.dumps(data, ensure_ascii=False, indent=2)
+  dirn=os.path.dirname(path); os.makedirs(dirn, exist_ok=True)
+  fd,tmp=tempfile.mkstemp(prefix=".tmp-", dir=dirn)
+  try:
+    with os.fdopen(fd,"w") as f: f.write(d)
+    os.replace(tmp,path)
+  finally:
+    try: os.remove(tmp)
+    except: pass
 
 def load_users():
-    if not os.path.exists(USERS_FILE): return []
-    try:
-        with open(USERS_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return []
+  v=read_json(USERS_FILE,[])
+  out=[]
+  for u in v:
+    out.append({"user":u.get("user",""),
+                "password":u.get("password",""),
+                "expires":u.get("expires",""),
+                "port":str(u.get("port","")) if u.get("port","")!="" else "",
+                "bind_ip":u.get("bind_ip","")})
+  return out
 
-def save_users(users):
-    write_json_atomic(USERS_FILE, users)
+def save_users(users): write_json_atomic(USERS_FILE, users)
 
-def write_json_atomic(filename, data):
-    """Write JSON data to a file safely using a temporary file."""
-    temp_filename = filename + ".tmp"
-    with open(temp_filename, 'w') as f:
-        json.dump(data, f, indent=2)
-    os.rename(temp_filename, filename)
+def sh(cmd):
+  return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+def get_listen_port_from_config():
+  cfg=read_json(CONFIG_FILE,{})
+  listen=str(cfg.get("listen","")).strip()
+  m=re.search(r":(\d+)$", listen) if listen else None
+  return (m.group(1) if m else LISTEN_FALLBACK)
+
+def get_udp_listen_ports():
+  out=sh("ss -uHln").stdout
+  return set(re.findall(r":(\d+)\s", out))
 
 def pick_free_port():
-    users = load_users()
-    used_ports = {int(u["port"]) for u in users if u.get("port", "").isdigit()}
-    for port in range(6000, 20000):
-        if port not in used_ports:
-            return str(port)
-    return "auto" # Fallback, should not happen
+  used={str(u.get("port","")) for u in load_users() if str(u.get("port",""))}
+  used |= get_udp_listen_ports()
+  for p in range(6000,20000):
+    if str(p) not in used: return str(p)
+  return ""
 
-def hash_pass(p):
-    return hashlib.sha256(p.encode()).hexdigest()
+def has_recent_udp_activity(port):
+  if not port: return False
+  out=sh(f"conntrack -L -p udp 2>/dev/null | grep -w 'dport={port}' | head -n1 || true").stdout
+  return bool(out.strip())
 
-def require_login():
-    env = load_env()
-    admin_user = env.get("ADMIN_USER")
-    admin_pass_hash = hash_pass(env.get("ADMIN_PASS", ""))
-    
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Basic "):
-        try:
-            auth_decoded = base64.b64decode(auth_header.split(" ")[1]).decode()
-            user, password = auth_decoded.split(':', 1)
-            if user == admin_user and hash_pass(password) == admin_pass_hash:
-                return True
-        except:
-            pass
-            
-    if request.form.get("user") == admin_user and hash_pass(request.form.get("password", "")) == admin_pass_hash:
-        # Successful login via form, set a basic session/cookie for simplicity (optional, for stateless just use Basic Auth)
-        # Using a simple redirect and check for simplicity in this script's context
-        return True 
+def first_recent_src_ip(port):
+  if not port: return ""
+  out=sh(f"conntrack -L -p udp 2>/dev/null | awk \"/dport={port}\\b/ {{for(i=1;i<=NF;i++) if($i~/src=/){{split($i,a,'='); print a[2]; exit}}}}\"").stdout.strip()
+  return out if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', out) else ""
 
-    # For simplicity in this script, we rely on the redirect back to login and re-submission of form
-    return False
+def status_for_user(u, active_ports, listen_port):
+  port=str(u.get("port",""))
+  check_port=port if port else listen_port
+  if has_recent_udp_activity(check_port): return "Online"
+  if check_port in active_ports: return "Offline"
+  return "Unknown"
 
-def check_login():
-    env = load_env()
-    admin_user = env.get("ADMIN_USER")
-    admin_pass_hash = hash_pass(env.get("ADMIN_PASS", ""))
-    
-    if request.form.get("user") == admin_user and hash_pass(request.form.get("password", "")) == admin_pass_hash:
-        return True
-    return False
+def ipt(cmd): return sh(cmd)
+def ensure_limit_rules(port, ip):
+  if not (port and ip): return
+  ipt(f"iptables -C INPUT -p udp --dport {port} -s {ip} -j ACCEPT 2>/dev/null") or ipt(f"iptables -I INPUT -p udp --dport {port} -s {ip} -j ACCEPT")
+  ipt(f"iptables -C INPUT -p udp --dport {port} ! -s {ip} -j DROP 2>/dev/null") or ipt(f"iptables -I INPUT -p udp --dport {port} ! -s {ip} -j DROP")
 
-# --- IPTABLES (Connection Limit) Sync ---
-def sync_conn_limits():
-    """Applies iptables rules to limit connections to 1 per source IP per port."""
-    
-    # 1. ZIVPN_LIMIT Chain ကို ပြန်လည်စတင်ခြင်း (အဟောင်းတွေကို ရှင်းပစ်၊ အသစ်ဖန်တီး)
-    subprocess.run(f"iptables -t filter -F {IPTABLES_CHAIN} 2>/dev/null || true", shell=True)
-    subprocess.run(f"iptables -t filter -X {IPTABLES_CHAIN} 2>/dev/null || true", shell=True)
-    subprocess.run(f"iptables -t filter -N {IPTABLES_CHAIN}", shell=True)
+def remove_limit_rules(port):
+  if not port: return
+  for _ in range(20):
+    line=ipt(f"iptables -S INPUT | grep -E \"-p udp .* --dport {port}\\b .* (-j DROP|-j ACCEPT)\" | head -n1 || true").stdout.strip()
+    if not line: break
+    rule=line.replace('-A ','')
+    ipt(f"iptables -D INPUT {rule}")
 
-    # 2. INPUT chain ထဲမှာ ZIVPN_LIMIT ကို ခေါ်ဖို့ rule ထည့် (ရှိပြီးသားဆို ထပ်မထည့်ရ)
-    subprocess.run(f"iptables -t filter -C INPUT -p udp --dport 6000:19999 -j {IPTABLES_CHAIN} 2>/dev/null || "
-                   f"iptables -t filter -A INPUT -p udp --dport 6000:19999 -j {IPTABLES_CHAIN}", shell=True)
-    
-    users = load_users()
-    LIMIT_COUNT = 1 # 1 Connection per IP
-    
-    # 3. User တစ်ဦးချင်းစီအတွက် Connection Limit Rule များကို ထည့်
-    for u in users:
-      port = str(u.get("port", "")).strip()
-      if port and port.isdigit() and 6000 <= int(port) <= 19999:
-          rule = (f"iptables -t filter -A {IPTABLES_CHAIN} -p udp --dport {port} "
-                  f"-m connlimit --connlimit-above {LIMIT_COUNT} --connlimit-mask 32 -j DROP")
-          subprocess.run(rule, shell=True)
+def apply_device_limits(users):
+  for u in users:
+    p=str(u.get("port","") or "")
+    ip=(u.get("bind_ip","") or "").strip()
+    if p and ip: ensure_limit_rules(p, ip)
+    elif p: remove_limit_rules(p)
 
-    # 4. ကျန်တဲ့ traffic တွေကို လက်ခံဖို့
-    subprocess.run(f"iptables -t filter -A {IPTABLES_CHAIN} -j ACCEPT", shell=True)
-    
-    # 5. Save iptables rules permanently
-    subprocess.run("netfilter-persistent save", shell=True)
-
+def login_enabled(): return bool(ADMIN_USER and ADMIN_PASS)
+def is_authed(): return session.get("auth") == True
+def require_login(): return (not login_enabled()) or is_authed()
 
 def sync_config_passwords(mode="mirror"):
-    """Reads user list and updates the ZIVPN main config."""
-    users = load_users()
-    # Check if config file exists and load it, otherwise create a new structure
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            cfg = json.load(f)
-    else:
-        cfg = {"mode": "mirror", "configs": {}}
-        
-    cfg["configs"] = {}
-    for u in users:
-        # Note: Expires is for display only, the main ZIVPN logic handles it based on its own internal check
-        cfg["configs"][u["user"]] = u["password"]
+  cfg=read_json(CONFIG_FILE,{})
+  users=load_users()
+  users_pw=sorted({str(u["password"]) for u in users if u.get("password")})
+  if mode=="merge":
+    old=[]
+    if isinstance(cfg.get("auth",{}).get("config",None), list):
+      old=list(map(str, cfg["auth"]["config"]))
+    new_pw=sorted(set(old)|set(users_pw))
+  else:
+    new_pw=users_pw
+  if not isinstance(cfg.get("auth"),dict): cfg["auth"]={}
+  cfg["auth"]["mode"]="passwords"
+  cfg["auth"]["config"]=new_pw
+  cfg["listen"]=cfg.get("listen") or ":5667"
+  cfg["cert"]=cfg.get("cert") or "/etc/zivpn/zivpn.crt"
+  cfg["key"]=cfg.get("key") or "/etc/zivpn/zivpn.key"
+  cfg["obfs"]=cfg.get("obfs") or "zivpn"
+  write_json_atomic(CONFIG_FILE,cfg)
+  sh("systemctl restart zivpn.service")
 
-    write_json_atomic(CONFIG_FILE, cfg)
-    
-    # After saving user config, sync the iptables connection limits
-    sync_conn_limits()
-    
-    # Restart ZIVPN service to apply changes
-    subprocess.run("systemctl restart zivpn.service", shell=True)
+HTML = """<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ZIVPN Panel</title>
+<style>
+:root{--bg:#0b0f14;--fg:#e6edf3;--muted:#9aa7b3;--card:#111823;--bd:#1f2a37;--ok:#22c55e;--bad:#ef4444;--unk:#9ca3af}
+html,body{background:var(--bg);color:var(--fg)} body{font-family:system-ui,Segoe UI,Roboto,'Noto Sans Myanmar',sans-serif;margin:0;padding:14px}
+.wrap{max-width:1000px;margin:0 auto}
+header{display:flex;gap:12px;align-items:center;margin-bottom:10px}
+h1{margin:0;font-size:20px} .sub{color:var(--muted);font-size:13px}
+.btn{padding:9px 12px;border-radius:999px;border:1px solid var(--bd);background:#0e1623;color:var(--fg);text-decoration:none}
+.box{margin:12px 0;padding:12px;border:1px solid var(--bd);border-radius:14px;background:var(--card)}
+table{border-collapse:collapse;width:100%} th,td{border:1px solid var(--bd);padding:10px;text-align:left;font-size:14px}
+th{background:#0d1420;font-size:12.5px}
+.pill{display:inline-block;padding:4px 10px;border-radius:999px}
+.ok{background:var(--ok);color:#001009}.bad{background:var(--bad);color:#1b0000}.unk{background:var(--unk);color:#0b0f14}
+input{width:100%;max-width:420px;padding:10px;border:1px solid var(--bd);border-radius:12px;background:#0a1220;color:var(--fg)}
+.form-inline{display:flex;gap:10px;flex-wrap:wrap}.form-inline>div{min-width:180px;flex:1}
+@media(max-width:480px){ th,td{font-size:13px} .btn{padding:9px 10px} body{padding:10px} }
+</style></head><body>
+<div class="wrap">
+<header>
+  <img src="{{logo}}" style="height:40px;border-radius:10px">
+  <div style="flex:1">
+    <h1>DEV-U PHOE KAUNT</h1>
+    <div class="sub">ZIVPN Panel • Total: {{total}}</div>
+  </div>
+  {% if authed %}<a class="btn" href="/logout">Logout</a>{% endif %}
+</header>
 
+{% if not authed %}
+  <div class="box" style="max-width:440px;margin:40px auto">
+    {% if err %}<div style="color:var(--bad);margin-bottom:8px">{{err}}</div>{% endif %}
+    <form method="post" action="/login">
+      <label>Username</label><input name="u" autofocus required>
+      <label style="margin-top:8px">Password</label><input name="p" type="password" required>
+      <button class="btn" type="submit" style="margin-top:12px;width:100%">Login</button>
+    </form>
+  </div>
+{% else %}
 
-# --- HTML Templates (Single String for portability) ---
-HTML = """
-<!DOCTYPE html>
-<html lang="my">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ZIVPN Admin Panel</title>
-    <style>
-        :root {
-            --primary-color: #007bff;
-            --secondary-color: #6c757d;
-            --success-color: #28a745;
-            --danger-color: #dc3545;
-            --bg-color: #f4f7f6;
-            --card-bg: #ffffff;
-            --text-color: #333;
-        }
-        body { font-family: 'Arial', sans-serif; background-color: var(--bg-color); color: var(--text-color); margin: 0; padding: 0; }
-        .container { max-width: 1000px; margin: 20px auto; padding: 0 15px; }
-        header { background-color: var(--card-bg); padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-        .header-info { flex: 1 1 50%; display: flex; align-items: center; }
-        .header-info img { height: 50px; margin-right: 15px; border-radius: 4px; }
-        .header-info h1 { font-size: 1.5em; margin: 0; color: var(--primary-color); }
-        .header-info .sub { font-size: 0.9em; color: var(--secondary-color); margin-top: 5px; }
-        .header-actions { flex: 1 1 auto; text-align: right; }
-
-        /* Forms and Boxes */
-        .box { background-color: var(--card-bg); padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05); margin-bottom: 20px; }
-        .box h3 { border-bottom: 2px solid var(--primary-color); padding-bottom: 10px; margin-top: 0; color: var(--primary-color); }
-        .row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
-        .row > div { flex: 1; min-width: 150px; }
-        label { display: block; font-weight: bold; margin-bottom: 5px; font-size: 0.9em; }
-        input[type="text"], input[type="password"] { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        
-        /* Buttons */
-        .btn { padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; font-weight: bold; transition: background-color 0.3s; display: inline-block; text-align: center;}
-        .btn-primary { background-color: var(--primary-color); color: white; }
-        .btn-primary:hover { background-color: #0056b3; }
-        .btn-success { background-color: var(--success-color); color: white; }
-        .btn-success:hover { background-color: #1e7e34; }
-        .btn-danger { background-color: var(--danger-color); color: white; }
-        .btn-danger:hover { background-color: #bd2130; }
-        .btn-secondary { background-color: var(--secondary-color); color: white; }
-        .btn-secondary:hover { background-color: #5a6268; }
-
-        /* Messages */
-        .msg, .err { padding: 10px; border-radius: 4px; margin-bottom: 15px; font-weight: bold; }
-        .msg { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .err { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        
-        /* Table */
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; background-color: var(--card-bg); border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05); }
-        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #eee; font-size: 0.95em; }
-        th { background-color: var(--primary-color); color: white; font-weight: 600; }
-        tr:hover { background-color: #f8f9fa; }
-        .expired { background-color: #fff0f0 !important; color: var(--danger-color); font-weight: bold;}
-        .expired td { border-left: 5px solid var(--danger-color); }
-        
-        /* Action buttons in table */
-        td .actions { display: flex; gap: 5px; }
-        td .actions button, td .actions a { font-size: 0.8em; padding: 6px 8px; }
-        td .actions form { margin: 0; display: inline; }
-        
-        /* Responsive Table (for small screens) */
-        @media screen and (max-width: 600px) {
-            header { flex-direction: column; align-items: flex-start; }
-            .header-actions { margin-top: 10px; text-align: left; }
-            .row { flex-direction: column; gap: 0; }
-            .row > div { margin-bottom: 10px; }
-
-            /* Make table columns stack */
-            table, thead, tbody, th, td, tr { display: block; }
-            thead tr { position: absolute; top: -9999px; left: -9999px; } /* Hide table headers */
-            tr { border: 1px solid #ccc; margin-bottom: 15px; border-radius: 8px;}
-            td { border: none; border-bottom: 1px solid #eee; position: relative; padding-left: 50%; text-align: right; }
-            td:before { 
-                position: absolute; 
-                top: 6px; 
-                left: 6px; 
-                width: 45%; 
-                padding-right: 10px; 
-                white-space: nowrap;
-                text-align: left; 
-                font-weight: bold;
-                color: var(--primary-color);
-            }
-            td:nth-of-type(1):before { content: "👤 User"; }
-            td:nth-of-type(2):before { content: "🔑 Password"; }
-            td:nth-of-type(3):before { content: "⏰ Expires"; }
-            td:nth-of-type(4):before { content: "🔌 Port"; }
-            td:nth-of-type(5):before { content: "⚙️ Manage"; border-bottom: none;}
-            td .actions { justify-content: flex-end; }
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <header>
-        <div class="header-info">
-            <div>
-                <h1>ZIVPN Admin Panel</h1>
-                <div class="sub">👥 Total Users: <strong>{{ user_count }}</strong> | Today: {{ today }}</div>
-            </div>
-        </div>
-        <div class="header-actions">
-            <form method="post" action="/logout">
-                <button class="btn btn-secondary" type="submit">Logout</button>
-            </form>
-        </div>
-    </header>
-
-    {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
-    {% if err %}<div class="err">{{err}}</div>{% endif %}
-
-    <div class="box">
-        <h3>➕ အသုံးပြုသူအသစ် ထည့်သွင်းရန်</h3>
-        <form method="post" action="/add">
-            <div class="row">
-                <div><label>👤 User</label><input name="user" required></div>
-                <div><label>🔑 Password</label><input name="password" required></div>
-                <div><label>⏰ Expires (YYYY-MM-DD or Days)</label><input name="expires" placeholder="2025-12-31 or 30"></div>
-                <div><label>🔌 UDP Port (6000–19999)</label><input name="port" placeholder="auto"></div>
-            </div>
-            <button class="btn btn-success" type="submit">Add User + Sync</button>
-        </form>
-    </div>
-
-    <div class="box">
-        <h3>📋 အသုံးပြုသူ စာရင်း</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>👤 User</th>
-                    <th>🔑 Password</th>
-                    <th>⏰ Expires</th>
-                    <th>🔌 Port</th>
-                    <th>⚙️ Manage</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for u in users %}
-                <tr class="{% if u.expires and u.expires < today %}expired{% endif %}">
-                    <td>{{ u.user }}</td>
-                    <td>{{ u.password }}</td>
-                    <td>{{ u.expires if u.expires else "N/A" }}</td>
-                    <td>{{ u.port if u.port else "N/A" }}</td>
-                    <td>
-                        <div class="actions">
-                            <a class="btn btn-primary" href="/edit/{{ u.user }}">Edit</a> 
-                            <form method="post" action="/delete" onsubmit="return confirm('User: {{ u.user }} ကို ဖျက်မလား? ပြန်ပြင်လို့မရပါ');">
-                                <input type="hidden" name="user" value="{{u.user}}">
-                                <button type="submit" class="btn btn-danger">Delete</button>
-                            </form>
-                        </div>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
+<div class="box">
+  <h3 style="margin:4px 0 8px">➕ အသုံးပြုသူ အသစ်ထည့်ရန်</h3>
+  {% if msg %}<div style="color:var(--ok);margin:6px 0">{{msg}}</div>{% endif %}
+  {% if err %}<div style="color:var(--bad);margin:6px 0">{{err}}</div>{% endif %}
+  <form method="post" action="/add" class="form-inline">
+    <div><label>👤 User</label><input name="user" required></div>
+    <div><label>🔑 Password</label><input name="password" required></div>
+    <div><label>⏰ Expires</label><input name="expires" placeholder="2025-12-31 or 30"></div>
+    <div><label>🔌 UDP Port</label><input name="port" placeholder="auto"></div>
+    <div><label>📱 Bind IP (1 device)</label><input name="bind_ip" placeholder="auto when online…"></div>
+    <div style="align-self:end"><button class="btn" type="submit">Save + Sync</button></div>
+  </form>
 </div>
-</body>
-</html>
-"""
 
-# --- Edit Template (Simple version, uses the same style) ---
-EDIT_HTML = """
-<div class="container">
-    <header>
-        <a href="/" class="btn btn-secondary" style="margin-right: 15px;">&larr; Back to Users</a>
-        <div class="header-info">
-            <div><h1>ZIVPN Admin Panel</h1></div>
-        </div>
-    </header>
-
-    {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
-    {% if err %}<div class="err">{{err}}</div>{% endif %}
-
-    <div class="box">
-      <h3>✏️ အသုံးပြုသူ အချက်အလက် ပြန်ပြင်ရန်: {{ current_user.user }}</h3>
-      <form method="post" action="/update">
-        <input type="hidden" name="old_user" value="{{ current_user.user }}">
-        <div class="row">
-          <div><label>👤 User</label><input name="user" required value="{{ current_user.user }}"></div>
-          <div><label>🔑 Password</label><input name="password" required value="{{ current_user.password }}"></div>
-        </div>
-        <div class="row">
-          <div><label>⏰ Expires (YYYY-MM-DD or days)</label><input name="expires" placeholder="2025-12-31 or 30" value="{{ current_user.expires if current_user.expires else '' }}"></div>
-          <div><label>🔌 UDP Port (6000–19999)</label><input name="port" placeholder="auto" value="{{ current_user.port if current_user.port else '' }}"></div>
-        </div>
-        <button class="btn btn-primary" type="submit">Save Changes + Sync</button>
+<table>
+  <tr>
+    <th>👤 User</th><th>🔑 Password</th><th>⏰ Expires</th><th>🔌 Port</th><th>📱 Bind IP</th><th>🔎 Status</th><th>✏️ Edit</th><th>🗑️ Delete</th>
+  </tr>
+  {% for u in users %}
+  <tr>
+    <td>{{u.user}}</td>
+    <td>{{u.password}}</td>
+    <td>{% if u.expires %}{{u.expires}}{% else %}<span style="opacity:.6">—</span>{% endif %}</td>
+    <td>{{u.port or "—"}}</td>
+    <td>{{u.bind_ip or "—"}}</td>
+    <td>{% if u.status=="Online" %}<span class="pill ok">Online</span>{% elif u.status=="Offline" %}<span class="pill bad">Offline</span>{% else %}<span class="pill unk">Unknown</span>{% endif %}</td>
+    <td>
+      <form method="get" action="/edit" style="display:inline">
+        <input type="hidden" name="user" value="{{u.user}}">
+        <button class="btn" type="submit">Edit</button>
       </form>
-    </div>
+    </td>
+    <td>
+      <form method="post" action="/delete" onsubmit="return confirm('ဖျက်မလား?')" style="display:inline">
+        <input type="hidden" name="user" value="{{u.user}}">
+        <button class="btn" style="background:#2a0f0f;border-color:#3b1d1d">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+{% endif %}
 </div>
+</body></html>
 """
 
-# --- Flask Routes ---
+def get_active_ports(): return get_udp_listen_ports()
+
+def build_view(msg="", err=""):
+  if login_enabled() and session.get("auth")!=True:
+    return render_template_string(HTML, authed=False, logo=LOGO_URL, err=session.pop("login_err", None), total=0)
+  users=load_users()
+  # Auto-bind when online (first src IP)
+  changed=False
+  for u in users:
+    if u.get("port") and not u.get("bind_ip"):
+      ip=first_recent_src_ip(u["port"])
+      if ip: u["bind_ip"]=ip; changed=True
+  if changed: save_users(users)
+  apply_device_limits(users)
+  active=get_active_ports()
+  listen_port=get_listen_port_from_config()
+  view=[]
+  for u in users:
+    view.append(type("U",(),{
+      "user":u.get("user",""),
+      "password":u.get("password",""),
+      "expires":u.get("expires",""),
+      "port":u.get("port",""),
+      "bind_ip":u.get("bind_ip",""),
+      "status":("Online" if has_recent_udp_activity(u.get("port") or listen_port) else ("Offline" if (u.get("port") or listen_port) in active else "Unknown"))
+    }))
+  view.sort(key=lambda x:(x.user or "").lower())
+  return render_template_string(HTML, authed=True, logo=LOGO_URL, users=view, msg=msg, err=err, total=len(view))
+
+def login_enabled(): return bool(ADMIN_USER and ADMIN_PASS)
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+  if not login_enabled(): return redirect(url_for('index'))
+  if request.method=="POST":
+    u=(request.form.get("u") or "").strip()
+    p=(request.form.get("p") or "").strip()
+    if hmac.compare_digest(u, ADMIN_USER) and hmac.compare_digest(p, ADMIN_PASS):
+      session["auth"]=True; return redirect(url_for('index'))
+    session["auth"]=False; session["login_err"]="မှန်ကန်မှုမရှိပါ (username/password)"; return redirect(url_for('login'))
+  return render_template_string(HTML, authed=False, logo=LOGO_URL, err=session.pop("login_err", None), total=0)
+
+@app.route("/logout", methods=["GET"])
+def logout():
+  session.pop("auth", None)
+  return redirect(url_for('login') if login_enabled() else url_for('index'))
 
 @app.route("/", methods=["GET"])
-def index():
-    if not check_login():
-        return redirect(url_for('login'))
-    return build_view()
-
-@app.route("/", methods=["POST"])
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        if check_login():
-            return redirect(url_for('index'))
-        return render_template_string(LOGIN_HTML, err="Invalid Username or Password")
-    
-    # Login HTML (Basic)
-    LOGIN_HTML = """
-    <!DOCTYPE html>
-    <html lang="my">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Login</title>
-        <style>
-            body { font-family: 'Arial', sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-            .login-box { background-color: #fff; padding: 40px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1); width: 300px; text-align: center; }
-            .login-box h2 { color: #007bff; margin-bottom: 25px; }
-            input { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-            button { width: 100%; padding: 10px; border: none; border-radius: 4px; background-color: #007bff; color: white; cursor: pointer; font-weight: bold; }
-            .err { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; border-radius: 4px; margin-bottom: 15px; font-weight: bold; font-size: 0.9em;}
-        </style>
-    </head>
-    <body>
-        <div class="login-box">
-            <h2>Admin Login</h2>
-            {% if err %}<div class="err">{{err}}</div>{% endif %}
-            <form method="post" action="/login">
-                <input type="text" name="user" placeholder="Username" required>
-                <input type="password" name="password" placeholder="Password" required>
-                <button type="submit">Login</button>
-            </form>
-        </div>
-    </body>
-    </html>
-    """
-    return render_template_string(LOGIN_HTML)
-
-@app.route("/logout", methods=["POST"])
-def logout():
-    # Simple logout: redirect to login without setting auth headers
-    return redirect(url_for('login'))
+def index(): return build_view()
 
 @app.route("/add", methods=["POST"])
 def add_user():
-    if not check_login(): return redirect(url_for('login', err="Please login again."))
-    
-    user=(request.form.get("user") or "").strip()
-    password=(request.form.get("password") or "").strip()
-    expires=(request.form.get("expires") or "").strip()
-    port=(request.form.get("port") or "").strip()
+  if login_enabled() and session.get("auth")!=True: return redirect(url_for('login'))
+  user=(request.form.get("user") or "").strip()
+  password=(request.form.get("password") or "").strip()
+  expires=(request.form.get("expires") or "").strip()
+  port=(request.form.get("port") or "").strip()
+  bind_ip=(request.form.get("bind_ip") or "").strip()
+  if expires.isdigit(): expires=(datetime.now()+timedelta(days=int(expires))).strftime("%Y-%m-%d")
+  if not user or not password: return build_view(err="User/Password လိုအပ်")
+  if port and (not re.fullmatch(r"\d{2,5}",port) or not (6000<=int(port)<=19999)): return build_view(err="Port 6000–19999")
+  if not port: port=pick_free_port()
+  users=load_users(); rep=False
+  for u in users:
+    if u.get("user","").lower()==user.lower():
+      u.update({"password":password,"expires":expires,"port":port,"bind_ip":bind_ip}); rep=True; break
+  if not rep: users.append({"user":user,"password":password,"expires":expires,"port":port,"bind_ip":bind_ip})
+  save_users(users); sync_config_passwords()
+  return build_view(msg="Saved & Synced")
 
-    if expires.isdigit():
-        expires=(datetime.now() + timedelta(days=int(expires))).strftime("%Y-%m-%d")
+@app.route("/edit", methods=["GET","POST"])
+def edit_user():
+  if login_enabled() and session.get("auth")!=True: return redirect(url_for('login'))
+  if request.method=="GET":
+    q=(request.args.get("user") or "").strip().lower()
+    users=load_users(); t=[u for u in users if u.get("user","").lower()==q]
+    if not t: return build_view(err="မတွေ့ပါ")
+    u=t[0]
+    frm=f"""<div class='wrap box'><h3>✏️ Edit: {u.get('user')}</h3>
+    <form method='post' action='/edit' class='form-inline'>
+      <input type='hidden' name='orig' value='{u.get('user')}'>
+      <div><label>👤 User</label><input name='user' value='{u.get('user')}' required></div>
+      <div><label>🔑 Password</label><input name='password' value='{u.get('password')}' required></div>
+      <div><label>⏰ Expires</label><input name='expires' value='{u.get('expires','')}' placeholder='2025-12-31 or 30'></div>
+      <div><label>🔌 UDP Port</label><input name='port' value='{u.get('port','')}'></div>
+      <div><label>📱 Bind IP</label><input name='bind_ip' value='{u.get('bind_ip','')}' placeholder='blank = no lock'></div>
+      <div style='align-self:end'><button class='btn' type='submit'>Save</button> <a class='btn' href='/'>Cancel</a></div>
+    </form></div>"""
+    base=build_view(); return base.replace("</div>\n</body>","</div>"+frm+"</body>")
+  orig=(request.form.get("orig") or "").strip().lower()
+  user=(request.form.get("user") or "").strip()
+  password=(request.form.get("password") or "").strip()
+  expires=(request.form.get("expires") or "").strip()
+  port=(request.form.get("port") or "").strip()
+  bind_ip=(request.form.get("bind_ip") or "").strip()
+  if expires.isdigit(): expires=(datetime.now()+timedelta(days=int(expires))).strftime("%Y-%m-%d")
+  if not user or not password: return build_view(err="User/Password လိုအပ်")
+  if port and (not re.fullmatch(r"\d{2,5}",port) or not (6000<=int(port)<=19999)): return build_view(err="Port 6000–19999")
+  users=load_users(); found=False
+  for u in users:
+    if u.get("user","").lower()==orig:
+      oldp=u.get("port"); oldip=u.get("bind_ip","")
+      if oldp and (str(oldp)!=str(port) or oldip!=bind_ip): remove_limit_rules(oldp)
+      u.update({"user":user,"password":password,"expires":expires,"port":port,"bind_ip":bind_ip}); found=True; break
+  if not found: return build_view(err="မတွေ့ပါ")
+  save_users(users); sync_config_passwords()
+  return redirect(url_for('index'))
 
-    if not user or not password:
-        return build_view(err="User နှင့် Password လိုအပ်သည်")
-    
-    if expires:
-        try: datetime.strptime(expires,"%Y-%m-%d")
-        except ValueError:
-            return build_view(err="Expires format မမှန်ပါ (YYYY-MM-DD)")
-    
-    # Port validation and auto-assign
-    if port:
-        if not port.isdigit() or not (6000 <= int(port) <= 19999):
-            return build_view(err="Port အကွာအဝေး 6000-19999 သို့မဟုတ် 'auto' ဖြစ်ရမည်")
-    else:
-        port=pick_free_port()
-
-    users=load_users()
-    # Check if user already exists (case-insensitive)
-    for u in users:
-        if u.get("user", "").lower() == user.lower():
-            return build_view(err=f"User '{user}' ရှိပြီးသားဖြစ်သည်. Edit ကိုသုံးပါ")
-
-    users.append({"user":user,"password":password,"expires":expires,"port":port})
-    save_users(users); sync_config_passwords()
-    return build_view(msg=f"User '{user}' successfully added and Synced")
-
+@app.route("/lock", methods=["POST"])
+def lock_now():
+  if login_enabled() and session.get("auth")!=True: return redirect(url_for('login'))
+  user=(request.form.get("user") or "").strip().lower()
+  op=(request.form.get("op") or "").strip()
+  users=load_users()
+  for u in users:
+    if u.get("user","").lower()==user:
+      p=u.get("port","")
+      if op=="clear":
+        u["bind_ip"]=""; save_users(users); apply_device_limits(users)
+        return build_view(msg=f"Cleared lock for {u['user']}")
+      ip=first_recent_src_ip(p)
+      if not ip: return build_view(err="UDP traffic မတွေ့ — client ချိတ်ပြီး Lock now ကိုပြန်နှိပ်")
+      u["bind_ip"]=ip; save_users(users); apply_device_limits(users)
+      return build_view(msg=f"Locked {u['user']} to {ip}")
+  return build_view(err="မတွေ့ပါ")
 
 @app.route("/delete", methods=["POST"])
-def del_user():
-    if not check_login(): return redirect(url_for('login', err="Please login again."))
-    user=(request.form.get("user") or "").strip()
-    if not user:
-        return build_view(err="User name မပါဝင်ပါ")
+def delete_user_html():
+  if login_enabled() and session.get("auth")!=True: return redirect(url_for('login'))
+  user=(request.form.get("user") or "").strip()
+  if not user: return build_view(err="User လိုအပ်")
+  remain=[]; removed=None
+  for u in load_users():
+    if u.get("user","").lower()==user.lower(): removed=u
+    else: remain.append(u)
+  if removed and removed.get("port"): remove_limit_rules(removed.get("port"))
+  save_users(remain); sync_config_passwords(mode="mirror")
+  return build_view(msg=f"Deleted: {user}")
 
-    users=load_users()
-    original_count = len(users)
-    users = [u for u in users if (u.get("user","").lower() != user.lower())]
-    
-    if len(users) == original_count:
-        return build_view(err=f"User '{user}' ကို ရှာမတွေ့ပါ")
-    
-    save_users(users); sync_config_passwords()
-    return build_view(msg=f"User '{user}' successfully deleted and Synced")
+@app.route("/api/users", methods=["GET"])
+def api_users():
+  if login_enabled() and session.get("auth")!=True:
+    return make_response(jsonify({"ok": False, "err":"login required"}), 401)
+  users=load_users(); active=get_udp_listen_ports(); listen_port=get_listen_port_from_config()
+  for u in users: u["status"]=status_for_user(u,active,listen_port)
+  return jsonify(users)
 
+@app.route("/favicon.ico")
+def favicon(): return ("",204)
 
-@app.route("/edit/<user_name>", methods=["GET"])
-def edit_user(user_name):
-    if not check_login(): return redirect(url_for('login', err="Please login again."))
-    
-    users = load_users()
-    current_user = next((u for u in users if u.get("user", "").lower() == user_name.lower()), None)
-    
-    if not current_user:
-        return build_view(err=f"User '{user_name}' not found.")
+@app.errorhandler(405)
+def handle_405(e): return redirect(url_for('index'))
 
-    # Convert dict to simple object for easy template access
-    class UserObject:
-        def __init__(self, data):
-            self.__dict__.update(data)
-    u_obj = UserObject(current_user)
-    
-    return render_template_string(HTML.split('</style>')[0] + '</style></head><body>' + EDIT_HTML, 
-                                  current_user=u_obj, logo=LOGO_URL)
+if __name__=="__main__":
+  app.run(host="0.0.0.0", port=8080)
+PY
+chmod 644 /etc/zivpn/web.py
 
-
-@app.route("/update", methods=["POST"])
-def update_user():
-    if not check_login(): return redirect(url_for('login', err="Please login again."))
-    
-    old_user = (request.form.get("old_user") or "").strip()
-    user=(request.form.get("user") or "").strip()
-    password=(request.form.get("password") or "").strip()
-    expires=(request.form.get("expires") or "").strip()
-    port=(request.form.get("port") or "").strip()
-
-    if expires.isdigit():
-        expires=(datetime.now() + timedelta(days=int(expires))).strftime("%Y-%m-%d")
-
-    if not user or not password:
-        return build_view(err="User နှင့် Password လိုအပ်သည်")
-    if expires:
-        try: datetime.strptime(expires,"%Y-%m-%d")
-        except ValueError:
-          return build_view(err="Expires format မမှန်ပါ (YYYY-MM-DD)")
-    
-    # Port validation
-    if port:
-        if not port.isdigit() or not (6000 <= int(port) <= 19999):
-            return build_view(err="Port အကွာအဝေး 6000-19999 သို့မဟုတ် 'auto' ဖြစ်ရမည်")
-    else:
-        port=pick_free_port()
-
-    users=load_users(); 
-    # Old user ကို ဖျက်ပြီး update လုပ်မယ့် user name အသစ်နဲ့ အတူတူဆိုရင် edit လုပ်ခွင့်ပေးပါ
-    users = [u for u in users if (u.get("user","").lower() != old_user.lower())]
-
-    # Check if the NEW username already exists after removing OLD (if username was changed)
-    for u in users:
-        if u.get("user", "").lower() == user.lower():
-            # Old user ကို ဖျက်ပစ်ပြီးသားမို့၊ ဒီနေရာမှာတွေ့ရင် တခြားသူဖြစ်နေမှာ
-            return build_view(err=f"User '{user}' ရှိပြီးသားဖြစ်သည်. ကျေးဇူးပြု၍ တခြား နာမည်ပေးပါ")
-
-    # Add the updated data
-    users.append({"user":user,"password":password,"expires":expires,"port":port})
-    
-    save_users(users); sync_config_passwords()
-    return build_view(msg=f"User '{old_user}' ကို '{user}' အဖြစ် အချက်အလက် ပြန်ပြင်ပြီး Synced လုပ်ပြီးပါပြီ")
-
-
-def build_view(msg="", err=""):
-    """Main view builder to show user list and counts."""
-    users = load_users()
-    
-    # Sort users by expiration date (expired first)
-    def sort_key(u):
-        exp = u.get("expires", "9999-12-31")
-        return (exp == "9999-12-31", exp) # Non-expiring users go last
-
-    users.sort(key=sort_key)
-    
-    # Prepare data for template
-    today = datetime.now().strftime("%Y-%m-%d")
-    user_count = len(users)
-
-    return render_template_string(HTML, 
-                                  logo=LOGO_URL, 
-                                  users=users, 
-                                  msg=msg, 
-                                  err=err, 
-                                  today=today, 
-                                  user_count=user_count)
-
-
-if __name__ == '__main__':
-    # Flask runs on port 8080 by default (as per original script logic)
-    # The systemd service will handle running it with the correct config
-    # app.run(host='0.0.0.0', port=8080)
-    pass
-EOF_PYTHON
-
-# 5. Create/Update Systemd Service File
-cat << EOF_SERVICE > "$SYSTEMD_SERVICE_FILE"
+# ======= systemd: Web =======
+cat >/etc/systemd/system/zivpn-web.service <<'EOF'
 [Unit]
-Description=ZIVPN Web Admin Panel
+Description=ZIVPN Web Panel
 After=network.target
 
 [Service]
-# WARNING: Running as root is required for iptables (connlimit) in web.py
-# For production use, consider using a non-root user and granting NET_ADMIN capabilities.
+Type=simple
 User=root
-Group=root
-WorkingDirectory=/etc/zivpn
-ExecStart=/usr/bin/python3 ${PYTHON_APP_PATH}
+EnvironmentFile=-/etc/zivpn/web.env
+ExecStart=/usr/bin/python3 /etc/zivpn/web.py
 Restart=always
-EnvironmentFile=${ENV_FILE}
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF_SERVICE
+EOF
 
-# 6. Apply Changes and Enable Service
-echo "Enabling and starting ZIVPN Web Service..."
+# ======= Networking (DNAT+MASQ + UFW) =======
+echo -e "${Y}🌐 UDP DNAT + MASQUERADE + sysctl ဖွင့်နေ...${Z}"
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+
+IFACE="$(ip -4 route ls | awk '/default/ {print $5; exit}')" || true
+[ -n "${IFACE:-}" ] || IFACE=eth0
+iptables -t nat -C PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667 2>/dev/null || \
+iptables -t nat -I PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
+iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || \
+iptables -t nat -I POSTROUTING -o "$IFACE" -j MASQUERADE
+
+ufw allow 5667/udp >/dev/null 2>&1 || true
+ufw allow 6000:19999/udp >/dev/null 2>&1 || true
+ufw allow 8080/tcp >/dev/null 2>&1 || true
+ufw reload >/dev/null 2>&1 || true
+
+# ======= CRLF sanitize & enable =======
+sed -i 's/\r$//' /etc/zivpn/web.py /etc/systemd/system/zivpn.service /etc/systemd/system/zivpn-web.service || true
 systemctl daemon-reload
-systemctl enable zivpn-web.service
-systemctl restart zivpn-web.service
+systemctl enable --now zivpn.service
+systemctl enable --now zivpn-web.service
 
-# 7. Configure Firewall (UFW)
-echo "Configuring UFW firewall for Web Panel (8080/tcp) and VPN Ports (5667/udp, 6000-19999/udp)..."
-ufw allow 8080/tcp
-ufw allow 5667/udp
-ufw allow 6000:19999/udp
-ufw enable
-
-# 8. Initial Sync to apply iptables connection limits
-echo "Performing initial sync to set connection limits and ZIVPN config..."
-# Running web.py's function to sync config and iptables
-python3 -c "from web import sync_config_passwords; sync_config_passwords()" 2>/dev/null || true
-
-echo "--- Setup Complete! ---"
-echo "Web Admin Panel URL: http://<Your_Server_IP>:8080"
-echo "Login with the credentials you provided."
-    if request.form.get("user") == admin_user and hash_pass(request.form.get("password", "")) == admin_pass_hash:
-        # Successful login via form, set a basic session/cookie for simplicity (optional, for stateless just use Basic Auth)
-        # Using a simple redirect and check for simplicity in this script's context
-        return True 
-
-    # For simplicity in this script, we rely on the redirect back to login and re-submission of form
-    return False
-
-def check_login():
-    env = load_env()
-    admin_user = env.get("ADMIN_USER")
-    admin_pass_hash = hash_pass(env.get("ADMIN_PASS", ""))
-    
-    if request.form.get("user") == admin_user and hash_pass(request.form.get("password", "")) == admin_pass_hash:
-        return True
-    return False
-
-# --- IPTABLES (Connection Limit) Sync ---
-def sync_conn_limits():
-    """Applies iptables rules to limit connections to 1 per source IP per port."""
-    
-    # 1. ZIVPN_LIMIT Chain ကို ပြန်လည်စတင်ခြင်း (အဟောင်းတွေကို ရှင်းပစ်၊ အသစ်ဖန်တီး)
-    subprocess.run(f"iptables -t filter -F {IPTABLES_CHAIN} 2>/dev/null || true", shell=True)
-    subprocess.run(f"iptables -t filter -X {IPTABLES_CHAIN} 2>/dev/null || true", shell=True)
-    subprocess.run(f"iptables -t filter -N {IPTABLES_CHAIN}", shell=True)
-
-    # 2. INPUT chain ထဲမှာ ZIVPN_LIMIT ကို ခေါ်ဖို့ rule ထည့် (ရှိပြီးသားဆို ထပ်မထည့်ရ)
-    subprocess.run(f"iptables -t filter -C INPUT -p udp --dport 6000:19999 -j {IPTABLES_CHAIN} 2>/dev/null || "
-                   f"iptables -t filter -A INPUT -p udp --dport 6000:19999 -j {IPTABLES_CHAIN}", shell=True)
-    
-    users = load_users()
-    LIMIT_COUNT = 1 # 1 Connection per IP
-    
-    # 3. User တစ်ဦးချင်းစီအတွက် Connection Limit Rule များကို ထည့်
-    for u in users:
-      port = str(u.get("port", "")).strip()
-      if port and port.isdigit() and 6000 <= int(port) <= 19999:
-          rule = (f"iptables -t filter -A {IPTABLES_CHAIN} -p udp --dport {port} "
-                  f"-m connlimit --connlimit-above {LIMIT_COUNT} --connlimit-mask 32 -j DROP")
-          subprocess.run(rule, shell=True)
-
-    # 4. ကျန်တဲ့ traffic တွေကို လက်ခံဖို့
-    subprocess.run(f"iptables -t filter -A {IPTABLES_CHAIN} -j ACCEPT", shell=True)
-    
-    # 5. Save iptables rules permanently
-    subprocess.run("netfilter-persistent save", shell=True)
-
-
-def sync_config_passwords(mode="mirror"):
-    """Reads user list and updates the ZIVPN main config."""
-    users = load_users()
-    # Check if config file exists and load it, otherwise create a new structure
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            cfg = json.load(f)
-    else:
-        cfg = {"mode": "mirror", "configs": {}}
-        
-    cfg["configs"] = {}
-    for u in users:
-        # Note: Expires is for display only, the main ZIVPN logic handles it based on its own internal check
-        cfg["configs"][u["user"]] = u["password"]
-
-    write_json_atomic(CONFIG_FILE, cfg)
-    
-    # After saving user config, sync the iptables connection limits
-    sync_conn_limits()
-    
-    # Restart ZIVPN service to apply changes
-    # NOTE: The ZIVPN service may rely on apt_pkg, which should now be installed
-    subprocess.run("systemctl restart zivpn.service", shell=True)
-
-
-# --- HTML Templates (Single String for portability) ---
-HTML = """
-<!DOCTYPE html>
-<html lang="my">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ZIVPN Admin Panel</title>
-    <style>
-        :root {
-            --primary-color: #007bff;
-            --secondary-color: #6c757d;
-            --success-color: #28a745;
-            --danger-color: #dc3545;
-            --bg-color: #f4f7f6;
-            --card-bg: #ffffff;
-            --text-color: #333;
-        }
-        body { font-family: 'Arial', sans-serif; background-color: var(--bg-color); color: var(--text-color); margin: 0; padding: 0; }
-        .container { max-width: 1000px; margin: 20px auto; padding: 0 15px; }
-        header { background-color: var(--card-bg); padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-        .header-info { flex: 1 1 50%; display: flex; align-items: center; }
-        .header-info img { height: 50px; margin-right: 15px; border-radius: 4px; }
-        .header-info h1 { font-size: 1.5em; margin: 0; color: var(--primary-color); }
-        .header-info .sub { font-size: 0.9em; color: var(--secondary-color); margin-top: 5px; }
-        .header-actions { flex: 1 1 auto; text-align: right; }
-
-        /* Forms and Boxes */
-        .box { background-color: var(--card-bg); padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05); margin-bottom: 20px; }
-        .box h3 { border-bottom: 2px solid var(--primary-color); padding-bottom: 10px; margin-top: 0; color: var(--primary-color); }
-        .row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
-        .row > div { flex: 1; min-width: 150px; }
-        label { display: block; font-weight: bold; margin-bottom: 5px; font-size: 0.9em; }
-        input[type="text"], input[type="password"] { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        
-        /* Buttons */
-        .btn { padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; font-weight: bold; transition: background-color 0.3s; display: inline-block; text-align: center;}
-        .btn-primary { background-color: var(--primary-color); color: white; }
-        .btn-primary:hover { background-color: #0056b3; }
-        .btn-success { background-color: var(--success-color); color: white; }
-        .btn-success:hover { background-color: #1e7e34; }
-        .btn-danger { background-color: var(--danger-color); color: white; }
-        .btn-danger:hover { background-color: #bd2130; }
-        .btn-secondary { background-color: var(--secondary-color); color: white; }
-        .btn-secondary:hover { background-color: #5a6268; }
-
-        /* Messages */
-        .msg, .err { padding: 10px; border-radius: 4px; margin-bottom: 15px; font-weight: bold; }
-        .msg { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .err { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        
-        /* Table */
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; background-color: var(--card-bg); border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05); }
-        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #eee; font-size: 0.95em; }
-        th { background-color: var(--primary-color); color: white; font-weight: 600; }
-        tr:hover { background-color: #f8f9fa; }
-        .expired { background-color: #fff0f0 !important; color: var(--danger-color); font-weight: bold;}
-        .expired td { border-left: 5px solid var(--danger-color); }
-        
-        /* Action buttons in table */
-        td .actions { display: flex; gap: 5px; }
-        td .actions button, td .actions a { font-size: 0.8em; padding: 6px 8px; }
-        td .actions form { margin: 0; display: inline; }
-        
-        /* Responsive Table (for small screens) */
-        @media screen and (max-width: 600px) {
-            header { flex-direction: column; align-items: flex-start; }
-            .header-actions { margin-top: 10px; text-align: left; }
-            .row { flex-direction: column; gap: 0; }
-            .row > div { margin-bottom: 10px; }
-
-            /* Make table columns stack */
-            table, thead, tbody, th, td, tr { display: block; }
-            thead tr { position: absolute; top: -9999px; left: -9999px; } /* Hide table headers */
-            tr { border: 1px solid #ccc; margin-bottom: 15px; border-radius: 8px;}
-            td { border: none; border-bottom: 1px solid #eee; position: relative; padding-left: 50%; text-align: right; }
-            td:before { 
-                position: absolute; 
-                top: 6px; 
-                left: 6px; 
-                width: 45%; 
-                padding-right: 10px; 
-                white-space: nowrap;
-                text-align: left; 
-                font-weight: bold;
-                color: var(--primary-color);
-            }
-            td:nth-of-type(1):before { content: "👤 User"; }
-            td:nth-of-type(2):before { content: "🔑 Password"; }
-            td:nth-of-type(3):before { content: "⏰ Expires"; }
-            td:nth-of-type(4):before { content: "🔌 Port"; }
-            td:nth-of-type(5):before { content: "⚙️ Manage"; border-bottom: none;}
-            td .actions { justify-content: flex-end; }
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <header>
-        <div class="header-info">
-            <div>
-                <h1>ZIVPN Admin Panel</h1>
-                <div class="sub">👥 Total Users: <strong>{{ user_count }}</strong> | Today: {{ today }}</div>
-            </div>
-        </div>
-        <div class="header-actions">
-            <form method="post" action="/logout">
-                <button class="btn btn-secondary" type="submit">Logout</button>
-            </form>
-        </div>
-    </header>
-
-    {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
-    {% if err %}<div class="err">{{err}}</div>{% endif %}
-
-    <div class="box">
-        <h3>➕ အသုံးပြုသူအသစ် ထည့်သွင်းရန်</h3>
-        <form method="post" action="/add">
-            <div class="row">
-                <div><label>👤 User</label><input name="user" required></div>
-                <div><label>🔑 Password</label><input name="password" required></div>
-                <div><label>⏰ Expires (YYYY-MM-DD or Days)</label><input name="expires" placeholder="2025-12-31 or 30"></div>
-                <div><label>🔌 UDP Port (6000–19999)</label><input name="port" placeholder="auto"></div>
-            </div>
-            <button class="btn btn-success" type="submit">Add User + Sync</button>
-        </form>
-    </div>
-
-    <div class="box">
-        <h3>📋 အသုံးပြုသူ စာရင်း</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>👤 User</th>
-                    <th>🔑 Password</th>
-                    <th>⏰ Expires</th>
-                    <th>🔌 Port</th>
-                    <th>⚙️ Manage</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for u in users %}
-                <tr class="{% if u.expires and u.expires < today %}expired{% endif %}">
-                    <td>{{ u.user }}</td>
-                    <td>{{ u.password }}</td>
-                    <td>{{ u.expires if u.expires else "N/A" }}</td>
-                    <td>{{ u.port if u.port else "N/A" }}</td>
-                    <td>
-                        <div class="actions">
-                            <a class="btn btn-primary" href="/edit/{{ u.user }}">Edit</a> 
-                            <form method="post" action="/delete" onsubmit="return confirm('User: {{ u.user }} ကို ဖျက်မလား? ပြန်ပြင်လို့မရပါ');">
-                                <input type="hidden" name="user" value="{{u.user}}">
-                                <button type="submit" class="btn btn-danger">Delete</button>
-                            </form>
-                        </div>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-</div>
-</body>
-</html>
-"""
-
-# --- Edit Template (Simple version, uses the same style) ---
-EDIT_HTML = """
-<div class="container">
-    <header>
-        <a href="/" class="btn btn-secondary" style="margin-right: 15px;">&larr; Back to Users</a>
-        <div class="header-info">
-            <div><h1>ZIVPN Admin Panel</h1></div>
-        </div>
-    </header>
-
-    {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
-    {% if err %}<div class="err">{{err}}</div>{% endif %}
-
-    <div class="box">
-      <h3>✏️ အသုံးပြုသူ အချက်အလက် ပြန်ပြင်ရန်: {{ current_user.user }}</h3>
-      <form method="post" action="/update">
-        <input type="hidden" name="old_user" value="{{ current_user.user }}">
-        <div class="row">
-          <div><label>👤 User</label><input name="user" required value="{{ current_user.user }}"></div>
-          <div><label>🔑 Password</label><input name="password" required value="{{ current_user.password }}"></div>
-        </div>
-        <div class="row">
-          <div><label>⏰ Expires (YYYY-MM-DD or days)</label><input name="expires" placeholder="2025-12-31 or 30" value="{{ current_user.expires if current_user.expires else '' }}"></div>
-          <div><label>🔌 UDP Port (6000–19999)</label><input name="port" placeholder="auto" value="{{ current_user.port if current_user.port else '' }}"></div>
-        </div>
-        <button class="btn btn-primary" type="submit">Save Changes + Sync</button>
-      </form>
-    </div>
-</div>
-"""
-
-# --- Flask Routes ---
-
-@app.route("/", methods=["GET"])
-def index():
-    if not check_login():
-        return redirect(url_for('login'))
-    return build_view()
-
-@app.route("/", methods=["POST"])
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        if check_login():
-            return redirect(url_for('index'))
-        return render_template_string(LOGIN_HTML, err="Invalid Username or Password")
-    
-    # Login HTML (Basic)
-    LOGIN_HTML = """
-    <!DOCTYPE html>
-    <html lang="my">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Login</title>
-        <style>
-            body { font-family: 'Arial', sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-            .login-box { background-color: #fff; padding: 40px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1); width: 300px; text-align: center; }
-            .login-box h2 { color: #007bff; margin-bottom: 25px; }
-            input { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-            button { width: 100%; padding: 10px; border: none; border-radius: 4px; background-color: #007bff; color: white; cursor: pointer; font-weight: bold; }
-            .err { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; border-radius: 4px; margin-bottom: 15px; font-weight: bold; font-size: 0.9em;}
-        </style>
-    </head>
-    <body>
-        <div class="login-box">
-            <h2>Admin Login</h2>
-            {% if err %}<div class="err">{{err}}</div>{% endif %}
-            <form method="post" action="/login">
-                <input type="text" name="user" placeholder="Username" required>
-                <input type="password" name="password" placeholder="Password" required>
-                <button type="submit">Login</button>
-            </form>
-        </div>
-    </body>
-    </html>
-    """
-    return render_template_string(LOGIN_HTML)
-
-@app.route("/logout", methods=["POST"])
-def logout():
-    # Simple logout: redirect to login without setting auth headers
-    return redirect(url_for('login'))
-
-@app.route("/add", methods=["POST"])
-def add_user():
-    if not check_login(): return redirect(url_for('login', err="Please login again."))
-    
-    user=(request.form.get("user") or "").strip()
-    password=(request.form.get("password") or "").strip()
-    expires=(request.form.get("expires") or "").strip()
-    port=(request.form.get("port") or "").strip()
-
-    if expires.isdigit():
-        expires=(datetime.now() + timedelta(days=int(expires))).strftime("%Y-%m-%d")
-
-    if not user or not password:
-        return build_view(err="User နှင့် Password လိုအပ်သည်")
-    
-    if expires:
-        try: datetime.strptime(expires,"%Y-%m-%d")
-        except ValueError:
-            return build_view(err="Expires format မမှန်ပါ (YYYY-MM-DD)")
-    
-    # Port validation and auto-assign
-    if port:
-        if not port.isdigit() or not (6000 <= int(port) <= 19999):
-            return build_view(err="Port အကွာအဝေး 6000-19999 သို့မဟုတ် 'auto' ဖြစ်ရမည်")
-    else:
-        port=pick_free_port()
-
-    users=load_users()
-    # Check if user already exists (case-insensitive)
-    for u in users:
-        if u.get("user", "").lower() == user.lower():
-            return build_view(err=f"User '{user}' ရှိပြီးသားဖြစ်သည်. Edit ကိုသုံးပါ")
-
-    users.append({"user":user,"password":password,"expires":expires,"port":port})
-    save_users(users); sync_config_passwords()
-    return build_view(msg=f"User '{user}' successfully added and Synced")
-
-
-@app.route("/delete", methods=["POST"])
-def del_user():
-    if not check_login(): return redirect(url_for('login', err="Please login again."))
-    user=(request.form.get("user") or "").strip()
-    if not user:
-        return build_view(err="User name မပါဝင်ပါ")
-
-    users=load_users()
-    original_count = len(users)
-    users = [u for u in users if (u.get("user","").lower() != user.lower())]
-    
-    if len(users) == original_count:
-        return build_view(err=f"User '{user}' ကို ရှာမတွေ့ပါ")
-    
-    save_users(users); sync_config_passwords()
-    return build_view(msg=f"User '{user}' successfully deleted and Synced")
-
-
-@app.route("/edit/<user_name>", methods=["GET"])
-def edit_user(user_name):
-    if not check_login(): return redirect(url_for('login', err="Please login again."))
-    
-    users = load_users()
-    current_user = next((u for u in users if u.get("user", "").lower() == user_name.lower()), None)
-    
-    if not current_user:
-        return build_view(err=f"User '{user_name}' not found.")
-
-    # Convert dict to simple object for easy template access
-    class UserObject:
-        def __init__(self, data):
-            self.__dict__.update(data)
-    u_obj = UserObject(current_user)
-    
-    return render_template_string(HTML.split('</style>')[0] + '</style></head><body>' + EDIT_HTML, 
-                                  current_user=u_obj, logo=LOGO_URL)
-
-
-@app.route("/update", methods=["POST"])
-def update_user():
-    if not check_login(): return redirect(url_for('login', err="Please login again."))
-    
-    old_user = (request.form.get("old_user") or "").strip()
-    user=(request.form.get("user") or "").strip()
-    password=(request.form.get("password") or "").strip()
-    expires=(request.form.get("expires") or "").strip()
-    port=(request.form.get("port") or "").strip()
-
-    if expires.isdigit():
-        expires=(datetime.now() + timedelta(days=int(expires))).strftime("%Y-%m-%d")
-
-    if not user or not password:
-        return build_view(err="User နှင့် Password လိုအပ်သည်")
-    if expires:
-        try: datetime.strptime(expires,"%Y-%m-%d")
-        except ValueError:
-          return build_view(err="Expires format မမှန်ပါ (YYYY-MM-DD)")
-    
-    # Port validation
-    if port:
-        if not port.isdigit() or not (6000 <= int(port) <= 19999):
-            return build_view(err="Port အကွာအဝေး 6000-19999 သို့မဟုတ် 'auto' ဖြစ်ရမည်")
-    else:
-        port=pick_free_port()
-
-    users=load_users(); 
-    # Old user ကို ဖျက်ပြီး update လုပ်မယ့် user name အသစ်နဲ့ အတူတူဆိုရင် edit လုပ်ခွင့်ပေးပါ
-    users = [u for u in users if (u.get("user","").lower() != old_user.lower())]
-
-    # Check if the NEW username already exists after removing OLD (if username was changed)
-    for u in users:
-        if u.get("user", "").lower() == user.lower():
-            # Old user ကို ဖျက်ပစ်ပြီးသားမို့၊ ဒီနေရာမှာတွေ့ရင် တခြားသူဖြစ်နေမှာ
-            return build_view(err=f"User '{user}' ရှိပြီးသားဖြစ်သည်. ကျေးဇူးပြု၍ တခြား နာမည်ပေးပါ")
-
-    # Add the updated data
-    users.append({"user":user,"password":password,"expires":expires,"port":port})
-    
-    save_users(users); sync_config_passwords()
-    return build_view(msg=f"User '{old_user}' ကို '{user}' အဖြစ် အချက်အလက် ပြန်ပြင်ပြီး Synced လုပ်ပြီးပါပြီ")
-
-
-def build_view(msg="", err=""):
-    """Main view builder to show user list and counts."""
-    users = load_users()
-    
-    # Sort users by expiration date (expired first)
-    def sort_key(u):
-        exp = u.get("expires", "9999-12-31")
-        return (exp == "9999-12-31", exp) # Non-expiring users go last
-
-    users.sort(key=sort_key)
-    
-    # Prepare data for template
-    today = datetime.now().strftime("%Y-%m-%d")
-    user_count = len(users)
-
-    return render_template_string(HTML, 
-                                  logo=LOGO_URL, 
-                                  users=users, 
-                                  msg=msg, 
-                                  err=err, 
-                                  today=today, 
-                                  user_count=user_count)
-
-
-if __name__ == '__main__':
-    # Flask runs on port 8080 by default (as per original script logic)
-    # The systemd service will handle running it with the correct config
-    # app.run(host='0.0.0.0', port=8080)
-    pass
-EOF_PYTHON
-
-# 5. Create/Update Systemd Service File
-cat << EOF_SERVICE > "$SYSTEMD_SERVICE_FILE"
-[Unit]
-Description=ZIVPN Web Admin Panel
-After=network.target
-
-[Service]
-# WARNING: Running as root is required for iptables (connlimit) in web.py
-# For production use, consider using a non-root user and granting NET_ADMIN capabilities.
-User=root
-Group=root
-WorkingDirectory=/etc/zivpn
-ExecStart=/usr/bin/python3 ${PYTHON_APP_PATH}
-Restart=always
-EnvironmentFile=${ENV_FILE}
-
-[Install]
-WantedBy=multi-user.target
-EOF_SERVICE
-
-# 6. Apply Changes and Enable Service
-echo "Enabling and starting ZIVPN Web Service..."
-systemctl daemon-reload
-systemctl enable zivpn-web.service
-systemctl restart zivpn-web.service
-
-# 7. Configure Firewall (UFW)
-echo "Configuring UFW firewall for Web Panel (8080/tcp) and VPN Ports (5667/udp, 6000-19999/udp)..."
-ufw allow 8080/tcp
-ufw allow 5667/udp
-ufw allow 6000:19999/udp
-ufw enable
-
-# 8. Initial Sync to apply iptables connection limits
-echo "Performing initial sync to set connection limits and ZIVPN config..."
-# We run web.py's function directly to sync config and iptables
-python3 ${PYTHON_APP_PATH} sync_config_passwords 2>/dev/null || true
-
-echo "--- Setup Complete! ---"
-echo "Web Admin Panel URL: http://<Your_Server_IP>:8080"
-echo "Login with the credentials you provided."
+IP=$(hostname -I | awk '{print $1}')
+echo -e "\n$LINE\n${G}✅ Done${Z}"
+echo -e "${C}Web Panel   :${Z} ${Y}http://$IP:8080${Z}"
+echo -e "${C}users.json  :${Z} ${Y}/etc/zivpn/users.json${Z}"
+echo -e "${C}config.json :${Z} ${Y}/etc/zivpn/config.json${Z}"
+echo -e "${C}Services    :${Z} ${Y}systemctl status|restart zivpn  •  systemctl status|restart zivpn-web${Z}"
+echo -e "$LINE"
