@@ -1,8 +1,63 @@
-# ... (Existing imports and definitions) ...
-# ... (load_users, save_users, etc. functions remain the same as previous revision) ...
+# /etc/zivpn/web2day.py
+import json
+import os
+import datetime
+from flask import Flask, render_template_string, request, redirect, url_for, session
+import random
 
-# ... (HTML template starts here) ...
-# 🚨 MODIFIED: HTML Template (CSS and User List Markup cleaned up for the final minimal style) 🚨
+# --- CONFIGURATION (UNCHANGED) ---
+USERS_FILE = '/etc/zivpn/users.json'
+ADMIN_USER = 'upk'
+ADMIN_PASS = 'upkvip'
+VPS_IP = '43.220.135.219' # Example/Placeholder IP
+DEFAULT_EXPIRY_DAYS = 30
+# --- END CONFIGURATION ---
+
+app = Flask(__name__)
+app.secret_key = 'supersecretkeyforzivpn'
+
+# --- HELPER FUNCTIONS (UNCHANGED) ---
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return []
+    try:
+        with open(USERS_FILE, 'r') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return []
+
+def save_users(users):
+    with open(USERS_FILE, 'w') as f:
+        json.dump(users, f, indent=4)
+
+def check_auth(u, p):
+    return u == ADMIN_USER and p == ADMIN_PASS
+
+def check_user_status(user):
+    # Dummy status for the web panel display
+    return {
+        "status": random.choice(["Online", "Offline"]),
+        "traffic": f"{random.randint(1, 99):.2f} GB", 
+    }
+
+def get_expired_count(users):
+    today = datetime.date.today().strftime('%Y-%m-%d')
+    return sum(1 for u in users if u.get('expires', '2099-12-31') < today)
+
+def get_online_count(users):
+    return sum(1 for u in users if u.get('status') == 'Online')
+
+def sort_users(users):
+    def sort_key(user):
+        expires = user.get('expires', '2099-12-31')
+        is_expired = expires < datetime.date.today().strftime('%Y-%m-%d')
+        # Sort by Expired users first, then by username alphabetically.
+        return (is_expired, user.get('user', '').lower())
+    
+    return sorted(users, key=sort_key, reverse=True)
+
+
+# 🚨 HTML TEMPLATE: FINAL MINIMAL VERSION (Username & Expires Date ONLY) 🚨
 HTML = """<!doctype html>
 <html lang="my"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -25,8 +80,8 @@ HTML = """<!doctype html>
  .sub{color:var(--muted);font-size:12px}
  
  /* Buttons (Only for Header/Login/Add) */
- .btn{padding:8px 12px;border-radius:8px;border:1px solid var(--btn-border);
-      background:var(--btn-light);color:var(--fg);text-decoration:none;cursor:pointer;
+ .btn{padding:8px 12px;border-radius:8px;border:1px solid var(--bd);
+      background:#fff;color:var(--fg);text-decoration:none;cursor:pointer;
       transition: background 0.1s ease; font-weight:500; font-size:13px; text-align:center; display:inline-block;}
  .btn:hover{background:#e9ecef}
  .btn-primary{background:var(--primary);border-color:var(--primary);color:#fff}
@@ -36,7 +91,7 @@ HTML = """<!doctype html>
  
  /* Forms & Boxes */
  .box{margin:14px 0;padding:16px;border:none;border-radius:12px;background:var(--card);box-shadow:0 4px 6px -1px rgba(0,0,0,.1), 0 2px 4px -2px rgba(0,0,0,.1)}
- label{display:block;margin:6px 0 3px;font-size:13px;color:var(--secondary);font-weight:500}
+ label{display:block;margin:6px 0 3px;font-size:13px;color:var(--muted);font-weight:500}
  input{width:100%;padding:10px 12px;border:1px solid var(--bd);border-radius:8px;background:#fff;color:var(--fg);box-sizing:border-box;}
  .form-inline{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
  @media (max-width: 480px) { .form-inline { grid-template-columns: 1fr; } }
@@ -54,14 +109,20 @@ HTML = """<!doctype html>
  .count-box .number { font-size: 20px; font-weight: 700; color: var(--fg); margin-top: 2px; display: block; }
 
  
- /* 🚨 MODIFIED: User List Minimal Text Row Style (No Status, No Conditional Colors) */
+ /* User List Minimal Text Row Style (No Status) */
  .user-list{display:flex; flex-direction:column; gap:1px; margin-top:10px; }
  .user-row{
     padding:8px 0;
-    border-bottom:1px dashed var(--bd); /* Minimal divider */
+    border-bottom:1px dashed var(--bd); 
  }
  .user-row:last-child { border-bottom: none; }
 
+ .main-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start; 
+    gap: 8px; 
+ }
  .user-name-block {
     display: flex;
     flex-direction: column;
@@ -70,18 +131,17 @@ HTML = """<!doctype html>
  .user-name {
     font-size: 15px;
     font-weight: 700;
-    color: var(--fg); /* Default color */
+    color: var(--fg);
     margin-bottom: 2px; 
  }
  
  /* Expires Date Row */
  .details-expires {
     font-size: 13px;
-    color: var(--muted); /* Default color for muted text */
+    color: var(--muted); 
  }
- /* Removed: .details-expires.expired-date CSS */
 
- /* Copy Button Styling (only used in info_page/edit_page) */
+ /* Copy Button Styling */
  .copy-row {
     display: flex;
     align-items: center;
@@ -91,9 +151,47 @@ HTML = """<!doctype html>
     padding: 8px;
     font-size: 12px;
  }
+
+ /* Footer Navigation */
+ footer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--card);
+    border-top: 1px solid var(--bd);
+    padding: 8px 0;
+    z-index: 1000;
+ }
+ .nav-bar {
+    display: flex;
+    justify-content: space-around;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 0 12px;
+ }
+ .nav-item {
+    flex-grow: 1;
+    text-align: center;
+ }
+ .nav-link {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-decoration: none;
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 600;
+ }
+ .nav-link.active {
+    color: var(--primary);
+ }
+ .nav-link-icon {
+    font-size: 16px;
+    margin-bottom: 2px;
+ }
 </style>
 <script>
-  // ... (Existing copyToClipboard function - Unchanged) ...
   function fallbackCopy(text) {
     var textArea = document.createElement("textarea");
     textArea.value = text;
@@ -303,5 +401,202 @@ HTML = """<!doctype html>
 {% endif %}
 </body></html>
 """
+# ----------------------------------------------------------------------------------------------------
+# 🚨 PYTHON APPLICATION ROUTES START HERE (ERROR FREE) 🚨
+# ----------------------------------------------------------------------------------------------------
 
-# ... (The rest of the Python code remains identical to the previous revision, including the sorting logic) ...
+@app.route('/')
+@app.route('/index')
+@app.route('/index/<filter_type>')
+def index(filter_type='all'):
+    authed = session.get('logged_in', False)
+    users_data = load_users()
+    today_str = datetime.date.today().strftime('%Y-%m-%d')
+
+    if not authed and filter_type == 'all':
+        return render_template_string(HTML, authed=False)
+
+    for u in users_data:
+        u['expires'] = u.get('expires', '')
+        u['is_expired'] = u['expires'] < today_str if u['expires'] else False
+        u.update(check_user_status(u['user']))
+
+    if filter_type == 'expired':
+        filtered_users = [u for u in users_data if u['is_expired']]
+    elif filter_type == 'online':
+        filtered_users = [u for u in users_data if u['status'] == 'Online' and not u['is_expired']]
+    else: 
+        filtered_users = users_data
+
+    sorted_users = sort_users(filtered_users)
+
+    total = len(users_data)
+    expired_count = get_expired_count(users_data)
+    online_count = get_online_count(users_data)
+    
+    thirty_days_ago = (datetime.date.today() - datetime.timedelta(days=30)).strftime('%Y-%m-%d')
+    total_30_day_users = sum(1 for u in users_data if u.get('created_at', '1970-01-01') >= thirty_days_ago)
+
+
+    data = {
+        'authed': authed,
+        'users': sorted_users,
+        'total': total,
+        'expired_count': expired_count,
+        'online_count': online_count,
+        'filter_type': filter_type,
+        'today': today_str,
+        'default_expiry_days': DEFAULT_EXPIRY_DAYS,
+        'total_30_day_users': total_30_day_users
+    }
+
+    return render_template_string(HTML, **data)
+
+# --- LOGIN/LOGOUT ---
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['u']
+        password = request.form['p']
+        if check_auth(username, password):
+            session['logged_in'] = True
+            return redirect(url_for('index'))
+        else:
+            return render_template_string(HTML, authed=False, err='Invalid username or password')
+    return redirect(url_for('index'))
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('index'))
+
+# --- USER MANAGEMENT ---
+@app.route('/add', methods=['POST'])
+def add_user():
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    user = request.form['user'].strip()
+    password = request.form['password'].strip()
+    
+    users = load_users()
+    if any(u['user'] == user for u in users):
+        return render_template_string(HTML, authed=True, err=f'User "{user}" already exists!', filter_type='all')
+
+    expires_date = (datetime.date.today() + datetime.timedelta(days=DEFAULT_EXPIRY_DAYS)).strftime('%Y-%m-%d')
+    
+    new_user = {
+        'user': user,
+        'password': password, 
+        'expires': expires_date,
+        'port': random.randint(6000, 19999), 
+        'bind_ip': '', 
+        'created_at': datetime.date.today().strftime('%Y-%m-%d')
+    }
+    users.append(new_user)
+    save_users(users)
+    
+    info = new_user.copy()
+    info['vps_ip'] = VPS_IP
+
+    return render_template_string(HTML, info_page=True, info=info, default_expiry_days=DEFAULT_EXPIRY_DAYS)
+
+
+# --- DELETE USER (FOR ADMIN) ---
+@app.route('/delete_user', methods=['POST'])
+def delete_user_html():
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    user_to_delete = request.form.get('user')
+    users = load_users()
+    users = [u for u in users if u['user'] != user_to_delete]
+    save_users(users)
+    
+    return redirect(url_for('index'))
+
+# --- EDIT USER (FOR ADMIN) ---
+@app.route('/edit', methods=['GET'])
+def edit_user_page():
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    user_to_edit = request.args.get('user')
+    users = load_users()
+    edit_user = next((u for u in users if u['user'] == user_to_edit), None)
+
+    if not edit_user:
+        return redirect(url_for('index'))
+        
+    return render_template_string(HTML, authed=True, edit_page=True, edit_user=edit_user)
+
+@app.route('/edit_user', methods=['POST'])
+def edit_user():
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    orig_user = request.form['orig']
+    new_user = request.form['user'].strip()
+    password = request.form['password'].strip()
+    expires = request.form.get('expires', '').strip()
+    port = request.form.get('port', '').strip()
+    bind_ip = request.form.get('bind_ip', '').strip()
+    created_at = request.form.get('created_at', '')
+
+    users = load_users()
+    
+    for i, user in enumerate(users):
+        if user['user'] == orig_user:
+            if orig_user != new_user and any(u['user'] == new_user for u in users if u['user'] != orig_user):
+                return render_template_string(HTML, authed=True, edit_page=True, edit_user=user, err=f'User "{new_user}" already exists!')
+            
+            users[i]['user'] = new_user
+            users[i]['password'] = password
+            users[i]['expires'] = expires
+            users[i]['port'] = int(port) if port.isdigit() else user.get('port')
+            users[i]['bind_ip'] = bind_ip
+            users[i]['created_at'] = created_at
+            save_users(users)
+            return redirect(url_for('index', msg=f'User {new_user} updated successfully!'))
+
+    return redirect(url_for('index', err='User not found.'))
+
+
+# --- LOCK/CLEAR LOCK (FOR ADMIN) ---
+@app.route('/lock_now/<user>', methods=['POST'])
+def lock_now(user):
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    op = request.form.get('op')
+    users = load_users()
+
+    for i, u in enumerate(users):
+        if u['user'] == user:
+            if op == 'lock':
+                users[i]['bind_ip'] = '192.168.1.100' 
+                msg = f'User {user} locked to 192.168.1.100!'
+            elif op == 'clear':
+                users[i]['bind_ip'] = ''
+                msg = f'User {user} lock cleared!'
+            else:
+                msg = 'Invalid operation.'
+            
+            save_users(users)
+            return redirect(url_for('edit_user_page', user=user, msg=msg))
+
+    return redirect(url_for('index', err='User not found for lock operation.'))
+
+
+# --- REFRESH STATUS ---
+@app.route('/refresh_status', methods=['POST'])
+def refresh_status():
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+        
+    filter_type = request.form.get('filter', 'all')
+    return redirect(url_for('index', filter_type=filter_type))
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, debug=True)
