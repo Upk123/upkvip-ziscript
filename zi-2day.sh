@@ -160,7 +160,7 @@ EOF
 # ===== Web Panel (Flask + Android UI + One-Device Lock) - Download from URL =====
 say "${Y}🖥️ Web Panel (Flask) ဒေါင်းပြီးထည့်နေ... (web2day.py)${Z}"
 # NOTE: This web.py will be renamed to web2day.py. It will need modifications for 2-day expiry and auto-cleanup.
-WEB_PY_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/web.py" 
+WEB_PY_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/web2day.py" 
 if curl -fsSL -o "$WEB_PY" "$WEB_PY_URL"; then
     say "${G}✅ web.py ကို ${WEB_PY_URL} မှ ဒေါင်းပြီး **web2day.py** အဖြစ် သိမ်းပြီးပါပြီ။${Z}"
 else
