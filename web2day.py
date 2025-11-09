@@ -2,7 +2,7 @@
 # ... (load_users, save_users, etc. functions remain the same as previous revision) ...
 
 # ... (HTML template starts here) ...
-# 🚨 MODIFIED: HTML Template (CSS and User List Markup changed to show only Username and Expires Date) 🚨
+# 🚨 MODIFIED: HTML Template (CSS and User List Markup cleaned up for the final minimal style) 🚨
 HTML = """<!doctype html>
 <html lang="my"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -13,7 +13,6 @@ HTML = """<!doctype html>
  :root{
   --bg:#f8f9fa; --fg:#212529; --muted:#6c757d; --card:#ffffff; --bd:#dee2e6;
   --ok:#198754; --bad:#dc3545; --primary:#0d6efd; 
-  --expired-color: #dc3545;
  }
  html,body{background:var(--bg);color:var(--fg)}
  body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;padding:12px 12px 70px 12px; min-height:100vh}
@@ -55,7 +54,7 @@ HTML = """<!doctype html>
  .count-box .number { font-size: 20px; font-weight: 700; color: var(--fg); margin-top: 2px; display: block; }
 
  
- /* 🚨 MODIFIED: User List Minimal Text Row Style */
+ /* 🚨 MODIFIED: User List Minimal Text Row Style (No Status, No Conditional Colors) */
  .user-list{display:flex; flex-direction:column; gap:1px; margin-top:10px; }
  .user-row{
     padding:8px 0;
@@ -63,13 +62,6 @@ HTML = """<!doctype html>
  }
  .user-row:last-child { border-bottom: none; }
 
- /* Username and Status Pill (Simplified) */
- .main-info {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start; 
-    gap: 8px; 
- }
  .user-name-block {
     display: flex;
     flex-direction: column;
@@ -78,23 +70,18 @@ HTML = """<!doctype html>
  .user-name {
     font-size: 15px;
     font-weight: 700;
-    color: var(--fg);
+    color: var(--fg); /* Default color */
     margin-bottom: 2px; 
  }
  
- /* Status Pill is NOT USED in this version */
-
  /* Expires Date Row */
  .details-expires {
     font-size: 13px;
-    color: var(--muted);
+    color: var(--muted); /* Default color for muted text */
  }
- .details-expires.expired-date {
-     color: var(--expired-color);
-     font-weight: 600;
- }
+ /* Removed: .details-expires.expired-date CSS */
 
- /* Copy Button Styling */
+ /* Copy Button Styling (only used in info_page/edit_page) */
  .copy-row {
     display: flex;
     align-items: center;
@@ -284,11 +271,10 @@ HTML = """<!doctype html>
         <div class="user-name-block">
             <div class="user-name">{{u.user}}</div>
             
-            <div class="details-expires {% if u.is_expired %}expired-date{% endif %}">
+            <div class="details-expires">
                 ⏰ ကုန်ရက်: {% if u.expires %}{{u.expires}}{% else %}—{% endif %}
             </div>
         </div>
-      
         </div>
     
   </div>
