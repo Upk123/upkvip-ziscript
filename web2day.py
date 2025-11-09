@@ -2,7 +2,7 @@
 # ... (load_users, save_users, etc. functions remain the same as previous revision) ...
 
 # ... (HTML template starts here) ...
-# 🚨 MODIFIED: HTML Template (CSS and User List Markup changed to show only Expired status) 🚨
+# 🚨 MODIFIED: HTML Template (CSS and User List Markup changed to show only Username and Expires Date) 🚨
 HTML = """<!doctype html>
 <html lang="my"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -63,7 +63,7 @@ HTML = """<!doctype html>
  }
  .user-row:last-child { border-bottom: none; }
 
- /* Username and Status Pill */
+ /* Username and Status Pill (Simplified) */
  .main-info {
     display: flex;
     justify-content: space-between;
@@ -81,18 +81,8 @@ HTML = """<!doctype html>
     color: var(--fg);
     margin-bottom: 2px; 
  }
-
- /* Status Pill (Text Only - Only for Expired) */
- .status-pill{
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-weight: 700;
-    white-space: nowrap;
- }
- /* ONLY KEEP EXPIRED STATUS CSS */
- .status-expired{background:#f8d7da;color:var(--expired-color);font-weight:700;border:1px solid var(--expired-color)}
-
+ 
+ /* Status Pill is NOT USED in this version */
 
  /* Expires Date Row */
  .details-expires {
@@ -104,7 +94,7 @@ HTML = """<!doctype html>
      font-weight: 600;
  }
 
- /* Remove copy-row styling if any */
+ /* Copy Button Styling */
  .copy-row {
     display: flex;
     align-items: center;
@@ -299,7 +289,6 @@ HTML = """<!doctype html>
             </div>
         </div>
       
-        {% if u.is_expired %}<span class="status-pill status-expired">Expired</span>{% endif %}
         </div>
     
   </div>
