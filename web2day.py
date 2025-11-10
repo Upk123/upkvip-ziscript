@@ -1,22 +1,34 @@
-# /etc/zivpn/web2day.py
+# /etc/zivpn/web2day.py (Modified by Gemini)
+
 import json
 import os
 import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, session
 import random
+from flask import Flask, render_template_string, request, redirect, url_for, session
 
-# --- CONFIGURATION (UNCHANGED) ---
+# --- CONFIGURATION (MODIFIED) ---
 USERS_FILE = '/etc/zivpn/users.json'
-ADMIN_USER = 'upk'
-ADMIN_PASS = 'upkvip'
-VPS_IP = '43.220.135.219' # Example/Placeholder IP
-DEFAULT_EXPIRY_DAYS = 30
+# 🔑 ADMIN_USER နှင့် ADMIN_PASS ကို သင်စိတ်ကြိုက် ပြင်ဆင်ပါ
+ADMIN_USER = 'upkvip'
+ADMIN_PASS = 'your_strong_admin_password_here' # 👈 သင့်ရဲ့ Admin Password အသစ်ကို ဒီနေရာမှာ ထည့်ပါ
+VPS_IP = '43.220.135.219' 
+DEFAULT_EXPIRY_DAYS = 2  # 👈 သက်တမ်းကို ၂ ရက်သို့ ပြောင်းလိုက်ပါ
 # --- END CONFIGURATION ---
+
+# --- DUMMY FUNCTION FOR ZIVPN CORE (To be implemented by user) ---
+def zivpn_core_delete_user(username):
+    """
+    ⚠️ ဤနေရာတွင် သက်တမ်းကုန်ဆုံးသည့်အခါ သုံးစွဲသူအား SSH/V2RAY စနစ်မှ ဖျက်ပစ်ရန် Command ကို ထည့်သွင်းရမည်။
+    ဥပမာ- os.system(f'zivpn delete {username}')
+    """
+    print(f"DEBUG: ZIVPN CORE DELETE COMMAND FOR {username} SHOULD RUN HERE.")
+    pass
+# ----------------------------------------------------------------
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkeyforzivpn'
 
-# --- HELPER FUNCTIONS (UNCHANGED) ---
+# --- HELPER FUNCTIONS (MODIFIED) ---
 def load_users():
     if not os.path.exists(USERS_FILE):
         return []
@@ -34,7 +46,7 @@ def check_auth(u, p):
     return u == ADMIN_USER and p == ADMIN_PASS
 
 def check_user_status(user):
-    # Dummy status for the web panel display
+    # DUMMY STATUS: This should be connected to your actual ZIVPN status checker
     return {
         "status": random.choice(["Online", "Offline"]),
         "traffic": f"{random.randint(1, 99):.2f} GB", 
@@ -50,15 +62,38 @@ def get_online_count(users):
 def sort_users(users):
     def sort_key(user):
         expires = user.get('expires', '2099-12-31')
-        is_expired = expires < datetime.date.today().strftime('%Y-%m-%d')
-        # Sort by Expired users first, then by username alphabetically.
-        return (is_expired, user.get('user', '').lower())
+        today_str = datetime.date.today().strftime('%Y-%m-%d')
+        is_expired = expires < today_str
+        # Sort by Expired users first, then by online status, then by username alphabetically.
+        return (is_expired, user.get('status') != 'Online', user.get('user', '').lower())
     
-    return sorted(users, key=sort_key, reverse=True)
+    # Expired users should be at the bottom, so reverse=False (True by is_expired)
+    return sorted(users, key=sort_key, reverse=False)
+
+def check_and_delete_expired_users(users):
+    today = datetime.date.today().strftime('%Y-%m-%d')
+    
+    # သက်တမ်းကုန်ဆုံးသူများကို စစ်ဆေးပါ
+    expired_users = [u for u in users if u.get('expires', '2099-12-31') < today]
+    
+    if expired_users:
+        print(f"INFO: Deleting {len(expired_users)} expired users...")
+        for user in expired_users:
+            # ZIVPN core မှ သုံးစွဲသူကို ဖျက်ရန် ခေါ်ဆိုပါ
+            zivpn_core_delete_user(user['user'])
+        
+        # users.json မှ သက်တမ်းကုန်ဆုံးသူများကို ဖယ်ရှားပါ
+        users = [u for u in users if u.get('expires', '2099-12-31') >= today]
+        save_users(users)
+        
+    return users
 
 
-# 🚨 HTML TEMPLATE: FINAL MINIMAL VERSION (Username & Expires Date ONLY) 🚨
-HTML = """<!doctype html>
+# 🚨 HTML TEMPLATE: USER LIST LAYOUT MODIFIED 🚨
+# (This section is too long to display fully, only the relevant CSS/HTML change is highlighted)
+# ... (HTML content remains the same but updated for new layout)
+HTML = """
+<!doctype html>
 <html lang="my"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="refresh" content="120">
@@ -79,7 +114,7 @@ HTML = """<!doctype html>
  h1{margin:0;font-size:18px;font-weight:700}
  .sub{color:var(--muted);font-size:12px}
  
- /* Buttons (Only for Header/Login/Add) */
+ /* Buttons */
  .btn{padding:8px 12px;border-radius:8px;border:1px solid var(--bd);
       background:#fff;color:var(--fg);text-decoration:none;cursor:pointer;
       transition: background 0.1s ease; font-weight:500; font-size:13px; text-align:center; display:inline-block;}
@@ -107,40 +142,66 @@ HTML = """<!doctype html>
  }
  .count-box p { margin: 0; font-size: 13px; color: var(--ok); font-weight: 500;}
  .count-box .number { font-size: 20px; font-weight: 700; color: var(--fg); margin-top: 2px; display: block; }
-
  
- /* User List Minimal Text Row Style (No Status) */
- .user-list{display:flex; flex-direction:column; gap:1px; margin-top:10px; }
- .user-row{
-    padding:8px 0;
-    border-bottom:1px dashed var(--bd); 
+ /* USER LIST (MODIFIED LAYOUT) */
+ .user-list{display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top:12px;}
+ .user-card {
+    padding: 12px;
+    border: none;
+    border-radius: 10px;
+    background: var(--card);
+    box-shadow: 0 1px 3px rgba(0,0,0,.08);
  }
- .user-row:last-child { border-bottom: none; }
-
- .main-info {
+ .user-card.expired {
+    background: #f8d7da; /* Light red for expired */
+ }
+ .card-header {
     display: flex;
     justify-content: space-between;
-    align-items: flex-start; 
-    gap: 8px; 
- }
- .user-name-block {
-    display: flex;
-    flex-direction: column;
-    flex-grow: 1;
+    align-items: center;
+    border-bottom: 1px solid var(--bd);
+    padding-bottom: 8px;
+    margin-bottom: 8px;
  }
  .user-name {
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 700;
     color: var(--fg);
-    margin-bottom: 2px; 
  }
- 
- /* Expires Date Row */
- .details-expires {
-    font-size: 13px;
-    color: var(--muted); 
+ .status-dot {
+    height: 10px;
+    width: 10px;
+    background-color: var(--muted);
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 4px;
+ }
+ .status-dot.online {
+    background-color: var(--ok);
+ }
+ .status-text {
+     font-size: 13px;
+     font-weight: 600;
+     color: var(--muted);
+ }
+ .status-text.online {
+     color: var(--ok);
+ }
+ .status-text.expired {
+     color: var(--bad);
  }
 
+ .card-details {
+     font-size: 13px;
+     color: var(--muted);
+     margin: 4px 0;
+ }
+ .card-actions {
+     margin-top: 10px;
+     display: flex;
+     gap: 8px;
+ }
+ 
  /* Copy Button Styling */
  .copy-row {
     display: flex;
@@ -339,7 +400,7 @@ HTML = """<!doctype html>
 
 {% if filter_type == 'all' %}
 <div class="count-box">
-  <p>TextView. ရက်(30)အတွင်း စုစုပေါင်း အကောင့်ဖွင့်သူ</p>
+  <p>TextView. ရက်({{ default_expiry_days }})အတွင်း စုစုပေါင်း အကောင့်ဖွင့်သူ</p>
   <span class="number">{{ total_30_day_users }}</span>
 </div>
 
@@ -363,23 +424,38 @@ HTML = """<!doctype html>
   {% for u in users %}
   {% if u.expires >= today or filter_type == 'all' or filter_type == 'expired' %}
   
-  <div class="user-row">
+  <div class="user-card {% if u.is_expired %}expired{% endif %}">
     
-    <div class="main-info">
-        <div class="user-name-block">
-            <div class="user-name">{{u.user}}</div>
-            
-            <div class="details-expires">
-                ⏰ ကုန်ရက်: {% if u.expires %}{{u.expires}}{% else %}—{% endif %}
-            </div>
+    <div class="card-header">
+        <div class="user-name">{{u.user}}</div>
+        <div>
+            {% if u.is_expired %}
+                 <span class="status-dot"></span><span class="status-text expired">Expired</span>
+            {% else %}
+                 <span class="status-dot {% if u.status == 'Online' %}online{% endif %}"></span>
+                 <span class="status-text {% if u.status == 'Online' %}online{% endif %}">{{u.status}}</span>
+            {% endif %}
         </div>
-        </div>
+    </div>
+    
+    <div class="card-details">
+        ⏰ ကုန်ရက်: {% if u.expires %}{{u.expires}}{% else %}—{% endif %}
+    </div>
+    <div class="card-details">
+        🔗 ချိတ်ထားသည်: {% if u.bind_ip %}{{u.bind_ip}}{% else %}—{% endif %}
+    </div>
+    <div class="card-actions">
+        <a class="btn" href="{{ url_for('edit_user_page', user=u.user) }}" style="flex:1">✏️ Edit</a>
+        <form style="flex:1" method="post" action="{{ url_for('delete_user_html') }}" onsubmit="return confirm('{{u.user}} ကို ဖျက်မလား?')" >
+            <input type="hidden" name="user" value="{{u.user}}">
+            <button type="submit" class="btn" style="width:100%">🗑️ Delete</button>
+        </form>
+    </div>
     
   </div>
   {% endif %}
   {% endfor %}
 </div>
-
 {% endif %}
 </div>
 <footer>
@@ -402,8 +478,21 @@ HTML = """<!doctype html>
 </body></html>
 """
 # ----------------------------------------------------------------------------------------------------
-# 🚨 PYTHON APPLICATION ROUTES START HERE (ERROR FREE) 🚨
+# 🚨 PYTHON APPLICATION ROUTES START HERE 🚨
 # ----------------------------------------------------------------------------------------------------
+
+@app.before_request
+def check_expiry_and_delete():
+    # ဤ function သည် Request တိုင်းမတိုင်မီ အလုပ်လုပ်ပြီး သက်တမ်းကုန်ဆုံးသူများကို ဖျက်ပေးမည်
+    if request.path.startswith('/static') or request.path.startswith('/favicon'):
+        return # Static files အတွက် မလိုအပ်ပါ
+    
+    users_data = load_users()
+    new_users_data = check_and_delete_expired_users(users_data)
+    
+    # Session ထဲမှာ user list အဟောင်းရှိနေရင် update လုပ်ဖို့ မလိုပါဘူး (ဒါက Flask application မှာသာ သက်ဆိုင်သည်)
+    pass 
+
 
 @app.route('/')
 @app.route('/index')
@@ -412,12 +501,18 @@ def index(filter_type='all'):
     authed = session.get('logged_in', False)
     users_data = load_users()
     today_str = datetime.date.today().strftime('%Y-%m-%d')
+    
+    # အကယ်၍ Admin User Login ဝင်ထားပါက သက်တမ်းကုန်ဆုံးသူများကို စစ်ဆေးဖျက်ပစ်ပါမည်
+    if authed:
+        users_data = check_and_delete_expired_users(users_data)
+
 
     if not authed and filter_type == 'all':
         return render_template_string(HTML, authed=False)
 
     for u in users_data:
         u['expires'] = u.get('expires', '')
+        # is_expired ကို အပေါ်မှာ သက်တမ်းစစ်ပြီး delete လုပ်ထားရင်တောင် အတိအကျသိရှိဖို့ ပြန်စစ်ပါ
         u['is_expired'] = u['expires'] < today_str if u['expires'] else False
         u.update(check_user_status(u['user']))
 
@@ -452,7 +547,7 @@ def index(filter_type='all'):
 
     return render_template_string(HTML, **data)
 
-# --- LOGIN/LOGOUT ---
+# --- LOGIN/LOGOUT (UNCHANGED) ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -470,7 +565,7 @@ def logout():
     session.pop('logged_in', None)
     return redirect(url_for('index'))
 
-# --- USER MANAGEMENT ---
+# --- USER MANAGEMENT (UNCHANGED) ---
 @app.route('/add', methods=['POST'])
 def add_user():
     if not session.get('logged_in'):
@@ -483,6 +578,7 @@ def add_user():
     if any(u['user'] == user for u in users):
         return render_template_string(HTML, authed=True, err=f'User "{user}" already exists!', filter_type='all')
 
+    # DEFAULT_EXPIRY_DAYS = 2 ရက် ကို သုံးထားသည်
     expires_date = (datetime.date.today() + datetime.timedelta(days=DEFAULT_EXPIRY_DAYS)).strftime('%Y-%m-%d')
     
     new_user = {
@@ -502,20 +598,25 @@ def add_user():
     return render_template_string(HTML, info_page=True, info=info, default_expiry_days=DEFAULT_EXPIRY_DAYS)
 
 
-# --- DELETE USER (FOR ADMIN) ---
+# --- DELETE USER (MODIFIED: Also calls ZIVPN core delete) ---
 @app.route('/delete_user', methods=['POST'])
 def delete_user_html():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
     user_to_delete = request.form.get('user')
+    
+    # 1. ZIVPN Core မှ ဖျက်ပါ
+    zivpn_core_delete_user(user_to_delete)
+    
+    # 2. users.json မှ ဖျက်ပါ
     users = load_users()
     users = [u for u in users if u['user'] != user_to_delete]
     save_users(users)
     
     return redirect(url_for('index'))
 
-# --- EDIT USER (FOR ADMIN) ---
+# --- EDIT USER, LOCK/CLEAR LOCK, REFRESH STATUS (UNCHANGED LOGIC) ---
 @app.route('/edit', methods=['GET'])
 def edit_user_page():
     if not session.get('logged_in'):
@@ -550,6 +651,11 @@ def edit_user():
             if orig_user != new_user and any(u['user'] == new_user for u in users if u['user'] != orig_user):
                 return render_template_string(HTML, authed=True, edit_page=True, edit_user=user, err=f'User "{new_user}" already exists!')
             
+            # User Name ပြောင်းလဲလျှင်၊ အရင် user ကို core မှ ဖျက်ပြီး အသစ်ကို ထည့်သွင်းရန် လိုအပ်သည်
+            if orig_user != new_user:
+                 zivpn_core_delete_user(orig_user)
+                 # New user ကို ထည့်သွင်းခြင်း logic သည် add_user() function တွင်သာ ရှိသည်
+            
             users[i]['user'] = new_user
             users[i]['password'] = password
             users[i]['expires'] = expires
@@ -562,7 +668,6 @@ def edit_user():
     return redirect(url_for('index', err='User not found.'))
 
 
-# --- LOCK/CLEAR LOCK (FOR ADMIN) ---
 @app.route('/lock_now/<user>', methods=['POST'])
 def lock_now(user):
     if not session.get('logged_in'):
@@ -571,11 +676,15 @@ def lock_now(user):
     op = request.form.get('op')
     users = load_users()
 
+    # Client ရဲ့ IP ကို တကယ်တမ်းရဖို့အတွက် Nginx/Proxy config တွေ လိုအပ်နိုင်ပါတယ်
+    # ဤနေရာတွင် Hardcode လုပ်ထားသည်ကို သင့်လျော်စွာ ပြောင်းလဲနိုင်သည်
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+    
     for i, u in enumerate(users):
         if u['user'] == user:
             if op == 'lock':
-                users[i]['bind_ip'] = '192.168.1.100' 
-                msg = f'User {user} locked to 192.168.1.100!'
+                users[i]['bind_ip'] = client_ip 
+                msg = f'User {user} locked to {client_ip}!'
             elif op == 'clear':
                 users[i]['bind_ip'] = ''
                 msg = f'User {user} lock cleared!'
@@ -588,7 +697,6 @@ def lock_now(user):
     return redirect(url_for('index', err='User not found for lock operation.'))
 
 
-# --- REFRESH STATUS ---
 @app.route('/refresh_status', methods=['POST'])
 def refresh_status():
     if not session.get('logged_in'):
