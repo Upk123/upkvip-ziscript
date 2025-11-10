@@ -222,4 +222,3 @@ echo -e "${C}users.json  :${Z} ${Y}/etc/zivpn/users.json${Z}"
 echo -e "${C}Services    :${Z} ${Y}systemctl status|restart zivpn  •  systemctl status|restart zivpn-web${Z}"
 echo -e "$LINE"
 
-**ကျေးဇူးပြု၍ သက်တမ်း ၂ ရက် သတ်မှတ်ခြင်းနှင့် စာရင်းပြသခြင်း လုပ်ဆောင်ချက်များ ပါဝင်သော သင်ပြင်ဆင်ထားသည့် `web2day.py` ဖိုင်ကို ကျွန်တော်ထံ ပို့ပေးပါခင်ဗျာ။**
