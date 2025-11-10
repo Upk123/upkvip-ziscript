@@ -1,27 +1,26 @@
-# /etc/zivpn/web2day.py — Public ZIVPN Panel (Light UI)
-# - No login
-# - Auto expiry: 2 days from created_on
-# - Auto delete when expired (+ remove per-user DNAT)
+# /etc/zivpn/web2day.py — ZIVPN Public Panel (no login, no edit/delete)
+# Features:
+# - Add user only (no edit/delete UI)
+# - Auto expiry 2 days from created_on; expired users auto-removed (+ DNAT cleanup)
+# - Per-user DNAT rules (nat PREROUTING) -> show Online & Data (bytes/KB/MB/GB)
+# - Auto bind first client IP when traffic is seen (bind_ip)
 # - KPI: Today Created, This Month Created, Online, Expired
-# - User cards: Username + (Online/Active/Inactive) + Password + Data (KB/MB/GB) + Port + Bind IP + Expires
-# - Per-user DNAT rules with counters (nat PREROUTING) to detect Online & Data
-# - Delete button removed
+# - Mobile-friendly light UI
 
 from flask import Flask, render_template_string, request, redirect, url_for, session
 import json, subprocess, os, tempfile, re
 from datetime import datetime, timedelta, date
 
-# ------------------ CONFIG / PATHS ------------------
+# ---------- CONFIG ----------
 USERS_FILE   = "/etc/zivpn/users.json"
 CONFIG_FILE  = "/etc/zivpn/config.json"
-TRAFFIC_FILE = "/var/lib/zivpn/traffic.json"   # optional fallback {"user": bytes}
 WEB_PORT     = int(os.environ.get("WEB_PORT", "8080"))
 DEFAULT_DAYS = 2
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("WEB_SECRET", "change-me-dev")
 
-# ------------------ UTILITIES ------------------
+# ---------- IO / UTIL ----------
 def read_json(path, default):
     try:
         with open(path, "r") as f: return json.load(f)
@@ -85,7 +84,13 @@ def get_listen_port():
     m = re.search(r":(\d+)$", s) if s else None
     return m.group(1) if m else "5667"
 
-# -------- Per-user DNAT (nat PREROUTING) with counters --------
+def pick_free_port():
+    used = {int(u.get("port") or 0) for u in load_users() if u.get("port")}
+    for p in range(6000, 20000):
+        if p not in used: return str(p)
+    return ""
+
+# ---------- Per-user DNAT (nat PREROUTING) ----------
 def nat_rule_exists(user, port):
     out = shell("iptables -t nat -S PREROUTING").stdout.splitlines()
     tag = f"user:{user}"
@@ -109,12 +114,9 @@ def nat_rule_del(user=None, port=None):
         shell(f"iptables -t nat -D PREROUTING {rule}")
 
 def nat_counters():
-    """
-    Return {port: (pkts, bytes)} from nat PREROUTING counters.
-    """
+    # return {port: (pkts, bytes)}
     out = shell("iptables -t nat -L PREROUTING -v -x -n").stdout.splitlines()
     res={}
-    # example line includes: pkts   bytes  ... udp dpt:6003 to::5667 /* user:vip */
     for line in out:
         m = re.search(r"^\s*(\d+)\s+(\d+).*\budp\b.*dpt:(\d+).*DNAT.*\bto::5667\b", line)
         if m:
@@ -125,16 +127,23 @@ def nat_counters():
 def status_for_user_by_counters(port, counters):
     if not port: return "Inactive"
     pk, _ = counters.get(str(port), (0,0))
-    return "Online" if pk > 0 else "Inactive"
+    if pk >= 10:
+        return "Online"
+    elif pk > 0:
+        return "Active"
+    else:
+        return "Inactive"
 
 def try_autolock_bind_ip(u):
-    if u.get("bind_ip"): 
+    if u.get("bind_ip") or not u.get("port"):
         return
-    ip = shell("conntrack -L -p udp 2>/dev/null | awk '/dport=5667/ {for(i=1;i<=NF;i++) if($i~/src=/){split($i,a,\"=\"); print a[2]; exit}}'").stdout.strip()
+    port = u["port"]
+    cmd = f"conntrack -L -p udp 2>/dev/null | awk '/dport={port}/ && /src=/ {{for(i=1;i<=NF;i++) if($i~/src=/){{split($i,a,\"=\"); print a[2]; exit}}}}'"
+    ip = shell(cmd).stdout.strip()
     if re.fullmatch(r'(\d{1,3}\.){3}\d{1,3}', ip):
-        u["bind_ip"]=ip
+        u["bind_ip"] = ip
 
-# -------- Mirror panel passwords into ZIVPN config --------
+# ---------- Sync passwords to ZIVPN config ----------
 def sync_config_pw():
     cfg=read_json(CONFIG_FILE, {})
     users=load_users()
@@ -148,7 +157,7 @@ def sync_config_pw():
     write_json_atomic(CONFIG_FILE, cfg)
     shell("systemctl restart zivpn.service")
 
-# -------- Ensure expiry defaults + auto prune (and remove DNAT) --------
+# ---------- Auto expiry + prune (+ DNAT cleanup) ----------
 def ensure_expiry_and_prune(users):
     today = date.today()
     changed=False; kept=[]
@@ -162,14 +171,13 @@ def ensure_expiry_and_prune(users):
             exp=today+timedelta(days=DEFAULT_DAYS)
             u["expires"]=exp.strftime("%Y-%m-%d"); changed=True
         if exp < today:
-            # auto remove + per-user DNAT clear
             nat_rule_del(user=u.get("user",""), port=u.get("port"))
             continue
         kept.append(u)
     if changed or len(kept)!=len(users): save_users(kept)
     return kept
 
-# ------------------ THEME / HTML ------------------
+# ---------- THEME / HTML ----------
 LOGO_URL="https://raw.githubusercontent.com/Upk123/upkvip-ziscript/refs/heads/main/20251018_231111.png"
 
 HTML = """
@@ -317,11 +325,6 @@ function copyToClipboard(text){
           <div style="display:flex;justify-content:space-between;font-size:13px"><span class="muted">Bind IP</span><span><b>{{ u.bind_ip or "—" }}</b></span></div>
           <div style="display:flex;justify-content:space-between;font-size:13px"><span class="muted">Expires</span><span><b>{{ u.expires }}</b></span></div>
         </div>
-
-        <div style="display:flex;gap:8px;margin-top:10px">
-          <a class="btn" href="{{ url_for('edit_user', user=u.user) }}">✏️ Edit</a>
-          <!-- Delete button intentionally removed -->
-        </div>
       </div>
     {% endfor %}
   </div>
@@ -341,9 +344,9 @@ function copyToClipboard(text){
 </body></html>
 """
 
-# ------------------ VIEW BUILDER ------------------
+# ---------- VIEW ----------
 def build_view(msg="", err="", info_user=None):
-    users = ensure_expiry_and_prune(load_users())   # ensure defaults + prune + DNAT cleanup
+    users = ensure_expiry_and_prune(load_users())
     today_str = datetime.now().strftime("%Y-%m-%d")
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
     listen = get_listen_port()
@@ -351,7 +354,7 @@ def build_view(msg="", err="", info_user=None):
     # ensure per-user DNAT rules exist
     for u in users:
         if u.get("port"): nat_rule_add(u.get("user",""), u.get("port"))
-    ctr = nat_counters()  # read counters once
+    ctr = nat_counters()
 
     processed=[]; online=0; expired=0; today_new=0; month_new=0
     for u in users:
@@ -361,6 +364,7 @@ def build_view(msg="", err="", info_user=None):
             if not u.get("bind_ip"):
                 try_autolock_bind_ip(u); save_users(users)
 
+        # bytes per user port
         _, by = ctr.get(str(u.get("port","")), (0,0))
         t_h = bytes_to_human(by)
 
@@ -382,7 +386,6 @@ def build_view(msg="", err="", info_user=None):
     if f == "online": view = [x for x in processed if x["status"]=="Online"]
     elif f == "expired": view = [x for x in processed if x["expires"] < today_str]
     else: view = processed
-
     view.sort(key=lambda x: (x["status"]!="Online", (x["user"] or "").lower()))
 
     if info_user:
@@ -402,18 +405,14 @@ def build_view(msg="", err="", info_user=None):
         total=len(processed), filter_type=f, msg=msg, err=err
     )
 
-# ------------------ ROUTES ------------------
+# ---------- ROUTES ----------
 @app.route("/", methods=["GET"])
-def index(): 
+def index():
     return build_view()
 
 @app.route("/refresh_status", methods=["POST"])
 def refresh_status():
     return redirect(url_for('index', filter=request.args.get('filter','all')))
-
-# Public mode
-def login_enabled(): return False
-def require_login(): return True
 
 @app.route("/add", methods=["POST"])
 def add_user():
@@ -426,14 +425,9 @@ def add_user():
     today = date.today()
     expires = (today + timedelta(days=DEFAULT_DAYS)).strftime("%Y-%m-%d")
     created = today.strftime("%Y-%m-%d")
-    # pick unique UDP port for this user
-    # prefer free 6000-19999 (not used by others)
-    used = {int(u.get("port") or 0) for u in users if u.get("port")}
-    port = 0
-    for p in range(6000, 20000):
-        if p not in used: port = p; break
-    if not port: return build_view(err="အသုံးပြုရန် UDP port မရှိတော့ပါ")
-    rec = {"user":user,"password":password,"created_on":created,"expires":expires,"port":str(port),"bind_ip":""}
+    port = pick_free_port()
+    if not port: return build_view(err="အသုံးပြုရန် UDP port မထိုက်ပါ")
+    rec = {"user":user,"password":password,"created_on":created,"expires":expires,"port":port,"bind_ip":""}
 
     replaced=False
     for u in users:
@@ -442,9 +436,9 @@ def add_user():
     if not replaced: users.append(rec)
 
     save_users(users); sync_config_pw()
-    nat_rule_add(user, str(port))  # ensure DNAT rule exists for this user
+    nat_rule_add(user, port)
 
-    session["new_info"]= {"user":user,"password":password,"expires":expires,"port":str(port),"vps_ip":VPS_IP}
+    session["new_info"]= {"user":user,"password":password,"expires":expires,"port":port,"vps_ip":VPS_IP}
     return redirect(url_for("show_info"))
 
 @app.route("/show_info", methods=["GET"])
@@ -453,17 +447,11 @@ def show_info():
     if not info: return redirect(url_for("index"))
     return build_view(info_user=info)
 
-@app.route("/edit", methods=["GET","POST"])
-def edit_user():
-    # kept minimal for public panel
-    return redirect(url_for("index"))
-
 @app.route("/favicon.ico")
 def favicon(): return ("",204)
 
 @app.errorhandler(405)
 def _405(e): return redirect(url_for("index"))
 
-# ------------------ BOOT ------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=WEB_PORT)
