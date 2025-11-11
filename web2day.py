@@ -1,11 +1,12 @@
 # /etc/zivpn/web2day.py — ZIVPN Public Panel (no login, no edit/delete)
-# Features:
-# - Add user only (no edit/delete UI)
-# - Auto expiry 2 days from created_on; expired users auto-removed (+ DNAT cleanup)
-# - Per-user DNAT rules (nat PREROUTING) -> show Online & Data (bytes/KB/MB/GB)
-# - Auto bind first client IP when traffic is seen (bind_ip)
+# Solid Online/Data detection via mangle PREROUTING counters
+# - Add user only
+# - Auto expiry 2 days + auto prune (+ cleanup NAT & MANGLE rules)
+# - Per-user DNAT (nat PREROUTING) for port mapping
+# - Per-user COUNTERS (mangle PREROUTING) -> Online & Data (bytes/KB/MB/GB)
+# - Auto bind first seen client IP (best-effort)
 # - KPI: Today Created, This Month Created, Online, Expired
-# - Mobile-friendly light UI
+# - Mobile-first light UI
 
 from flask import Flask, render_template_string, request, redirect, url_for, session
 import json, subprocess, os, tempfile, re
@@ -90,7 +91,7 @@ def pick_free_port():
         if p not in used: return str(p)
     return ""
 
-# ---------- Per-user DNAT (nat PREROUTING) ----------
+# ---------- NAT (DNAT to 5667) ----------
 def nat_rule_exists(user, port):
     out = shell("iptables -t nat -S PREROUTING").stdout.splitlines()
     tag = f"user:{user}"
@@ -113,34 +114,60 @@ def nat_rule_del(user=None, port=None):
         rule = l.replace("-A PREROUTING","").strip()
         shell(f"iptables -t nat -D PREROUTING {rule}")
 
-def nat_counters():
+# ---------- MANGLE (counters on original dport) ----------
+def mangle_rule_exists(user, port):
+    out = shell("iptables -t mangle -S PREROUTING").stdout.splitlines()
+    tag = f"user:{user}"
+    patt = re.compile(rf"-A PREROUTING .* -p udp .* --dport {port}\b .* -m comment --comment {re.escape(tag)} .* -j RETURN")
+    return any(patt.search(l) for l in out)
+
+def mangle_rule_add(user, port):
+    if not (user and port): return
+    if mangle_rule_exists(user, port): return
+    tag = f"user:{user}"
+    # RETURN doesn’t change flow; only used for counters
+    shell(f"iptables -t mangle -I PREROUTING -p udp --dport {port} -m comment --comment {tag} -j RETURN")
+
+def mangle_rule_del(user=None, port=None):
+    lines = shell("iptables -t mangle -S PREROUTING").stdout.splitlines()
+    for l in lines:
+        if user and f"--comment user:{user}" not in l:
+            continue
+        if port and f"--dport {port}" not in l:
+            continue
+        rule = l.replace("-A PREROUTING","").strip()
+        shell(f"iptables -t mangle -D PREROUTING {rule}")
+
+def mangle_counters():
     # return {port: (pkts, bytes)}
-    out = shell("iptables -t nat -L PREROUTING -v -x -n").stdout.splitlines()
+    out = shell("iptables -t mangle -L PREROUTING -v -x -n").stdout.splitlines()
     res={}
+    # pkts bytes ... udp dpt:6003 /* user:vip */
     for line in out:
-        m = re.search(r"^\s*(\d+)\s+(\d+).*\budp\b.*dpt:(\d+).*DNAT.*\bto::5667\b", line)
+        m = re.search(r"^\s*(\d+)\s+(\d+).*\budp\b.*dpt:(\d+).*(?:/\*\s*user:.*\*/)?", line)
         if m:
             pk, by, pt = int(m.group(1)), int(m.group(2)), m.group(3)
-            res[pt] = (pk, by)
+            res[pt]=(pk, by)
     return res
 
+# ---------- Status / Bind IP ----------
 def status_for_user_by_counters(port, counters):
     if not port: return "Inactive"
     pk, _ = counters.get(str(port), (0,0))
-    if pk >= 10:
-        return "Online"
-    elif pk > 0:
-        return "Active"
-    else:
-        return "Inactive"
+    if pk > 0: return "Online"
+    return "Inactive"
 
 def try_autolock_bind_ip(u):
     if u.get("bind_ip") or not u.get("port"):
         return
+    # best-effort: find recent src for this port from conntrack (may miss in some cases)
     port = u["port"]
-    cmd = f"conntrack -L -p udp 2>/dev/null | awk '/dport={port}/ && /src=/ {{for(i=1;i<=NF;i++) if($i~/src=/){{split($i,a,\"=\"); print a[2]; exit}}}}'"
+    cmd = (
+        "conntrack -L -p udp 2>/dev/null | "
+        f"awk '/dport={port}/ && /src=/ {{for(i=1;i<=NF;i++) if($i~/src=/){{split($i,a,\"=\"); print a[2]; exit}}}}'"
+    )
     ip = shell(cmd).stdout.strip()
-    if re.fullmatch(r'(\d{1,3}\.){3}\d{1,3}', ip):
+    if re.fullmatch(r'(\\d{1,3}\\.){3}\\d{1,3}', ip):
         u["bind_ip"] = ip
 
 # ---------- Sync passwords to ZIVPN config ----------
@@ -157,7 +184,7 @@ def sync_config_pw():
     write_json_atomic(CONFIG_FILE, cfg)
     shell("systemctl restart zivpn.service")
 
-# ---------- Auto expiry + prune (+ DNAT cleanup) ----------
+# ---------- Auto expiry + prune (+ cleanup rules) ----------
 def ensure_expiry_and_prune(users):
     today = date.today()
     changed=False; kept=[]
@@ -172,6 +199,7 @@ def ensure_expiry_and_prune(users):
             u["expires"]=exp.strftime("%Y-%m-%d"); changed=True
         if exp < today:
             nat_rule_del(user=u.get("user",""), port=u.get("port"))
+            mangle_rule_del(user=u.get("user",""), port=u.get("port"))
             continue
         kept.append(u)
     if changed or len(kept)!=len(users): save_users(kept)
@@ -229,7 +257,6 @@ label{font-size:12px;color:var(--muted);margin-bottom:4px;display:block}
 .badge{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700}
 .dot{width:8px;height:8px;border-radius:50%}
 .b-online{background:#dcfce7;color:#065f46}.b-online .dot{background:var(--ok)}
-.b-active{background:#dbeafe;color:#1e40af}.b-active .dot{background:#3b82f6}
 .b-inact{background:#f3f4f6;color:#374151}.b-inact .dot{background:var(--unk)}
 
 .infobox{background:#ecfdf5;border:1px solid #a7f3d0;border-radius:14px;padding:14px;margin-top:14px}
@@ -311,8 +338,6 @@ function copyToClipboard(text){
           <div class="uname">{{ u.user }}</div>
           {% if u.status == "Online" %}
             <div class="badge b-online"><span class="dot"></span>Online</div>
-          {% elif u.status == "Active" %}
-            <div class="badge b-active"><span class="dot"></span>Active</div>
           {% else %}
             <div class="badge b-inact"><span class="dot"></span>Inactive</div>
           {% endif %}
@@ -351,10 +376,13 @@ def build_view(msg="", err="", info_user=None):
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
     listen = get_listen_port()
 
-    # ensure per-user DNAT rules exist
+    # ensure per-user NAT + MANGLE rules exist
     for u in users:
-        if u.get("port"): nat_rule_add(u.get("user",""), u.get("port"))
-    ctr = nat_counters()
+        if u.get("port"):
+            nat_rule_add(u.get("user",""), u.get("port"))
+            mangle_rule_add(u.get("user",""), u.get("port"))
+
+    ctr = mangle_counters()  # original dport counters
 
     processed=[]; online=0; expired=0; today_new=0; month_new=0
     for u in users:
@@ -364,7 +392,6 @@ def build_view(msg="", err="", info_user=None):
             if not u.get("bind_ip"):
                 try_autolock_bind_ip(u); save_users(users)
 
-        # bytes per user port
         _, by = ctr.get(str(u.get("port","")), (0,0))
         t_h = bytes_to_human(by)
 
@@ -436,7 +463,7 @@ def add_user():
     if not replaced: users.append(rec)
 
     save_users(users); sync_config_pw()
-    nat_rule_add(user, port)
+    nat_rule_add(user, port); mangle_rule_add(user, port)
 
     session["new_info"]= {"user":user,"password":password,"expires":expires,"port":port,"vps_ip":VPS_IP}
     return redirect(url_for("show_info"))
